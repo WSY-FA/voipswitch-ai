@@ -1,0 +1,30 @@
+{
+  "data_dir": "data",
+  "worker_count": 2,
+  "worker_queue_capacity": 128,
+  "execution": {
+    "asr_max_retries": 2,
+    "llm_max_retries": 2,
+    "retry_initial_delay_ms": 1000,
+    "retry_max_delay_ms": 10000,
+    "claim_lease_seconds": 60,
+    "claim_renew_interval_seconds": 20,
+    "post_call_job_deadline_seconds": 14400,
+    "max_manual_analysis_versions": 5
+  },
+  "capture_defaults": {
+    "complete_ratio_ppm": 995000,
+    "process_min_ratio_ppm": 950000,
+    "complete_max_gap_ms": 200,
+    "process_max_gap_ms": 5000
+  },
+  "storage": {
+    "temporary_audio_retention_hours": 72,
+    "persisted_audio_grace_hours": 1,
+    "unacknowledged_result_retention_hours": 168,
+    "disk_warning_percent": 70,
+    "disk_reject_percent": 85,
+    "disk_resume_percent": 75,
+    "disk_min_free_mb": 2048
+  }
+}

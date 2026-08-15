@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title data-i18n="page.title"></title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <main class="login" id="loginScreen" aria-hidden="false">
+    <section class="login-panel" aria-labelledby="loginTitle">
+      <div class="language-picker"><label for="languageSelect" data-i18n="language.label"></label><select id="languageSelect"><option value="zh-CN" data-i18n="language.zhCN"></option><option value="en-US" data-i18n="language.enUS"></option></select></div>
+      <p class="eyebrow" data-i18n="brand.control"></p>
+      <h1 id="loginTitle" data-i18n="page.title"></h1>
+      <p class="login-copy" data-i18n="login.copy"></p>
+      <form id="loginForm" class="login-form">
+        <label><span data-i18n="login.username"></span><input id="username" name="username" autocomplete="username" required value="admin"></label>
+        <label><span data-i18n="login.password"></span><input id="password" name="password" type="password" autocomplete="current-password" required value="admin"></label>
+        <button class="primary" id="loginButton" type="submit" data-i18n="login.submit"></button>
+        <p class="message" id="loginMessage" role="status"></p>
+      </form>
+    </section>
+  </main>
+
+  <main class="shell" id="app" hidden aria-hidden="true">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">AI</span><span data-i18n="brand.gateway"></span></div>
+      <nav aria-label="AI Gateway" data-i18n="nav.ariaLabel" data-i18n-attr="aria-label">
+        <a href="#overview" class="nav-link active" data-i18n="nav.overview"></a>
+        <a href="#providers" class="nav-link" data-i18n="nav.providers"></a>
+        <a href="#profiles" class="nav-link" data-i18n="nav.profiles"></a>
+      </nav>
+      <div class="sidebar-foot"><span id="currentUser"></span><button id="logout" class="text-button" type="button" data-i18n="nav.logout"></button></div>
+    </aside>
+
+    <section class="workspace">
+      <header class="topbar">
+        <div><p class="eyebrow" data-i18n="brand.runtimeCatalog"></p><h2 id="pageTitle" data-i18n="nav.overview"></h2></div>
+        <label class="language-picker" for="languageSelectApp"><span data-i18n="language.label"></span><select id="languageSelectApp"><option value="zh-CN" data-i18n="language.zhCN"></option><option value="en-US" data-i18n="language.enUS"></option></select></label>
+        <div class="connection"><span class="status-dot" id="statusDot"></span><span id="gatewayStatus" data-i18n="status.checking"></span><button id="refresh" class="secondary" type="button" data-i18n="common.refresh"></button></div>
+      </header>
+
+      <section class="view active" id="overview">
+        <div class="metric-grid">
+          <article class="metric"><span data-i18n="overview.catalogVersion"></span><strong id="catalogVersion">-</strong></article>
+          <article class="metric"><span data-i18n="overview.enabledProviders"></span><strong id="providerEnabled">-</strong></article>
+          <article class="metric"><span data-i18n="overview.executableProfiles"></span><strong id="profileExecutable">-</strong></article>
+        </div>
+        <section class="section-block">
+          <div class="section-heading"><div><p class="eyebrow" data-i18n="brand.catalog"></p><h3 data-i18n="overview.profileStatus"></h3></div></div>
+          <div class="table-wrap"><table><thead><tr><th data-i18n="table.profile"></th><th data-i18n="table.version"></th><th data-i18n="table.pipeline"></th><th data-i18n="table.asrProvider"></th><th data-i18n="table.status"></th></tr></thead><tbody id="overviewProfiles"></tbody></table></div>
+        </section>
+      </section>
+
+      <section class="view" id="providers" hidden>
+        <section class="section-block">
+          <div class="section-heading"><div><p class="eyebrow" data-i18n="brand.executionBackends"></p><h3 data-i18n="nav.providers"></h3></div><button class="primary add-button" id="addProviderButton" type="button" data-i18n="provider.add"></button></div>
+          <div class="table-wrap"><table><thead><tr><th data-i18n="table.provider"></th><th data-i18n="table.type"></th><th data-i18n="table.capability"></th><th data-i18n="table.secret"></th><th data-i18n="table.status"></th><th data-i18n="table.actions"></th></tr></thead><tbody id="providerRows"></tbody></table></div>
+        </section>
+      </section>
+
+      <section class="view" id="profiles" hidden>
+        <section class="section-block">
+          <div class="section-heading"><div><p class="eyebrow" data-i18n="brand.callAnalysis"></p><h3 data-i18n="nav.profiles"></h3></div><button class="primary add-button" id="addProfileButton" type="button" data-i18n="profile.add"></button></div>
+          <div class="table-wrap"><table><thead><tr><th data-i18n="table.profile"></th><th data-i18n="table.version"></th><th data-i18n="table.pipeline"></th><th data-i18n="table.asrProvider"></th><th data-i18n="table.llmProvider"></th><th data-i18n="table.status"></th><th data-i18n="table.actions"></th></tr></thead><tbody id="profileRows"></tbody></table></div>
+        </section>
+      </section>
+    </section>
+  </main>
+  <dialog class="modal" id="providerDialog">
+    <form class="modal__surface modal__surface--wide" id="providerForm">
+      <header class="modal__header"><div><p class="eyebrow" data-i18n="brand.executionBackends"></p><h2 id="providerDialogTitle" data-i18n="provider.add"></h2></div><button class="icon-button" type="button" data-close-dialog="providerDialog" data-i18n="actions.close" data-i18n-attr="aria-label">×</button></header>
+      <div class="modal__body"><input name="expected_revision" type="hidden"><div class="config-form provider-form"><label><span data-i18n="form.providerId"></span><input name="provider_id" required pattern="[A-Za-z0-9._:-]+"></label><label><span data-i18n="form.displayName"></span><input name="display_name" required maxlength="128"></label><label><span data-i18n="form.type"></span><select name="kind" id="providerKind"><option value="volcengine_asr" data-i18n="provider.kind.volcengineAsr"></option><option value="open_ai_compatible_llm" data-i18n="provider.kind.openAiCompatibleLlm"></option></select></label><fieldset class="provider-fields" id="volcengineFields" hidden><legend data-i18n="provider.volcengineFields"></legend><label><span data-i18n="form.apiVariant"></span><select name="api_variant"><option value="big_model_streaming" data-i18n="provider.apiVariant.bigModelStreaming"></option></select></label><label><span data-i18n="form.endpointOverride"></span><input name="endpoint_override" type="url" placeholder="wss://"></label><label><span data-i18n="form.appId"></span><input name="app_id"></label><label><span data-i18n="form.resourceId"></span><input name="resource_id"></label><label><span data-i18n="form.modelCluster"></span><input name="model_or_cluster"></label><label><span data-i18n="form.language"></span><input name="language" value="zh-CN"></label><label><span data-i18n="form.timeout"></span><input name="request_timeout_seconds" type="number" min="1" max="600" value="30"></label><label><span data-i18n="form.maxConcurrency"></span><input name="max_concurrent_sessions" type="number" min="1" value="10"></label><label><span data-i18n="form.maxSession"></span><input name="max_session_seconds" type="number" min="60" value="14400"></label><label class="secret-field"><span data-i18n="form.accessToken"></span><input name="secret" type="password" autocomplete="new-password"><small id="providerSecretHint"></small></label></fieldset><fieldset class="provider-fields" id="openAiFields" hidden><legend data-i18n="provider.openaiFields"></legend><label><span data-i18n="form.baseUrl"></span><input name="base_url" type="url" placeholder="https://provider.example/v1"></label><label><span data-i18n="form.model"></span><input name="model"></label><label><span data-i18n="form.outputMode"></span><select name="structured_output_mode"><option value="json_schema" data-i18n="provider.outputMode.jsonSchema"></option><option value="json_object" data-i18n="provider.outputMode.jsonObject"></option><option value="prompt_only" data-i18n="provider.outputMode.promptOnly"></option></select></label><label><span data-i18n="form.timeout"></span><input name="request_timeout_seconds" type="number" min="1" max="600" value="60"></label><label><span data-i18n="form.maxTokens"></span><input name="max_output_tokens" type="number" min="1" max="65536" value="2048"></label><label><span data-i18n="form.temperature"></span><input name="temperature" type="number" min="0" max="2" step="0.1" value="0.2"></label><label class="secret-field"><span data-i18n="form.apiKey"></span><input name="secret" type="password" autocomplete="new-password"><small id="providerSecretHintOpenAi"></small></label></fieldset><label class="check"><input name="enabled" type="checkbox" checked><span data-i18n="form.enabled"></span></label></div><p class="message" id="providerMessage" role="status"></p></div>
+      <footer class="modal__footer"><button class="secondary" type="button" data-close-dialog="providerDialog" data-i18n="common.cancel"></button><button class="primary" type="submit" data-i18n="provider.save"></button></footer>
+    </form>
+  </dialog>
+  <dialog class="modal" id="profileDialog">
+    <form class="modal__surface" id="profileForm"><header class="modal__header"><div><p class="eyebrow" data-i18n="brand.callAnalysis"></p><h2 id="profileDialogTitle" data-i18n="profile.add"></h2></div><button class="icon-button" type="button" data-close-dialog="profileDialog" data-i18n="actions.close" data-i18n-attr="aria-label">×</button></header><div class="modal__body"><div class="config-form profile-form"><label><span data-i18n="form.profileId"></span><input name="profile_id" required pattern="[A-Za-z0-9._:-]+"></label><input name="profile_version" type="hidden" value="1"><label><span data-i18n="form.pipelineType"></span><select name="pipeline_type" id="profilePipelineType"><option value="transcription" data-i18n="pipeline.transcription"></option><option value="post_call_analysis" data-i18n="pipeline.postCallAnalysis"></option><option value="llm_task" data-i18n="pipeline.llmTask"></option><option value="voice_agent" data-i18n="pipeline.voiceAgent"></option></select></label><label id="profileAsrField"><span data-i18n="form.asrProvider"></span><select name="asr_provider_id" id="profileAsrProvider"></select></label><label id="profileLlmField"><span data-i18n="form.llmProvider"></span><select name="llm_provider_id" id="profileLlmProvider"></select></label><label id="profileTtsField" hidden><span data-i18n="form.ttsProvider"></span><select name="tts_provider_id" id="profileTtsProvider"></select><small data-i18n="profile.ttsPending"></small></label><label class="check"><input name="enabled" type="checkbox" checked><span data-i18n="form.enabled"></span></label></div><p class="message" id="profileMessage" role="status"></p></div><footer class="modal__footer"><button class="secondary" type="button" data-close-dialog="profileDialog" data-i18n="common.cancel"></button><button class="primary" type="submit" data-i18n="profile.save"></button></footer></form>
+  </dialog>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

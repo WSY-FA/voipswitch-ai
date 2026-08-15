@@ -1,0 +1,9 @@
+[package]
+name = "ai-provider"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ai-protocol = { path = "../ai-protocol" }
+async-trait.workspace = true
+serde.workspace = true
