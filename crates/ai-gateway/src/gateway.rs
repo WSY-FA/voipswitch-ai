@@ -84,7 +84,8 @@ impl Gateway {
             )
         })?;
         let catalog = CatalogStore::open(&config.data_dir.join("gateway.db"), &config)?;
-        let providers = Arc::new(build_provider_registry(&catalog.load()?)?);
+        let loaded_catalog = catalog.load()?;
+        let providers = Arc::new(build_provider_registry(&catalog, &loaded_catalog)?);
         Self::open(config, providers, worker_instance_id)
     }
 
@@ -489,6 +490,9 @@ impl Gateway {
                 stream_id: stream.stream_id.clone(),
                 participant_id: stream.participant_id.clone(),
                 duration_ms: stats.received_duration_ms,
+                codec: stream.codec,
+                sample_rate: stream.sample_rate,
+                channels: stream.channels,
                 payload: self
                     .capture
                     .read_payloads(&stored.request.job.job_id, &stream.stream_id)?,
@@ -692,7 +696,7 @@ impl Gateway {
     }
 
     fn install_registry(&self, catalog: &GatewayCatalog) -> Result<()> {
-        let providers = Arc::new(build_provider_registry(catalog)?);
+        let providers = Arc::new(build_provider_registry(&self.catalog, catalog)?);
         *self.providers.write().unwrap() = providers;
         Ok(())
     }

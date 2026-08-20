@@ -6,4 +6,6 @@ edition.workspace = true
 [dependencies]
 ai-protocol = { path = "../ai-protocol" }
 async-trait.workspace = true
+reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true

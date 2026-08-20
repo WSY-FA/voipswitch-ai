@@ -1,7 +1,8 @@
 use ai_protocol::control::AiPipelineType;
 use ai_protocol::id::ProfileId;
 use ai_provider::{
-    OpenAiCompatibleLlmConfig, StructuredOutputMode, VolcengineApiVariant, VolcengineAsrConfig,
+    LocalHttpAsrConfig, OpenAiCompatibleLlmConfig, StructuredOutputMode, VolcengineApiVariant,
+    VolcengineAsrConfig,
 };
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -96,6 +97,11 @@ pub struct ProviderSecretStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GatewayProviderParameters {
+    LocalHttpAsr {
+        base_url: String,
+        language: String,
+        request_timeout_seconds: u64,
+    },
     VolcengineAsr {
         api_variant: VolcengineApiVariant,
         endpoint_override: Option<String>,
@@ -120,6 +126,11 @@ pub enum GatewayProviderParameters {
 impl GatewayProviderParameters {
     pub fn defaults_for(kind: GatewayProviderKind) -> Self {
         match kind {
+            GatewayProviderKind::LocalHttpAsr => Self::LocalHttpAsr {
+                base_url: "http://127.0.0.1:8000".to_string(),
+                language: "zh-CN".to_string(),
+                request_timeout_seconds: 60,
+            },
             GatewayProviderKind::VolcengineAsr => Self::VolcengineAsr {
                 api_variant: VolcengineApiVariant::BigModelStreaming,
                 endpoint_override: None,
@@ -144,6 +155,7 @@ impl GatewayProviderParameters {
 
     pub fn kind(&self) -> GatewayProviderKind {
         match self {
+            Self::LocalHttpAsr { .. } => GatewayProviderKind::LocalHttpAsr,
             Self::VolcengineAsr { .. } => GatewayProviderKind::VolcengineAsr,
             Self::OpenAiCompatibleLlm { .. } => GatewayProviderKind::OpenAiCompatibleLlm,
         }
@@ -151,6 +163,18 @@ impl GatewayProviderParameters {
 
     pub fn validate(&self) -> Result<()> {
         match self {
+            Self::LocalHttpAsr {
+                base_url,
+                language,
+                request_timeout_seconds,
+            } => LocalHttpAsrConfig {
+                base_url: base_url.clone(),
+                language: language.clone(),
+                request_timeout_seconds: *request_timeout_seconds,
+                enabled: true,
+            }
+            .validate()
+            .map_err(anyhow::Error::msg),
             Self::VolcengineAsr {
                 api_variant,
                 endpoint_override,
@@ -202,6 +226,7 @@ impl GatewayProviderParameters {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayProviderKind {
+    LocalHttpAsr,
     VolcengineAsr,
     OpenAiCompatibleLlm,
 }
@@ -209,6 +234,7 @@ pub enum GatewayProviderKind {
 impl GatewayProviderKind {
     pub fn capability(self) -> &'static str {
         match self {
+            Self::LocalHttpAsr => "asr",
             Self::VolcengineAsr => "asr",
             Self::OpenAiCompatibleLlm => "llm",
         }

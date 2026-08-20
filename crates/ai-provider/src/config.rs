@@ -1,5 +1,28 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalHttpAsrConfig {
+    pub base_url: String,
+    pub language: String,
+    pub request_timeout_seconds: u64,
+    pub enabled: bool,
+}
+
+impl LocalHttpAsrConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(self.base_url.starts_with("http://") || self.base_url.starts_with("https://")) {
+            return Err("base_url must use http or https".to_string());
+        }
+        if self.language.trim().is_empty() {
+            return Err("language is required".to_string());
+        }
+        if !(1..=600).contains(&self.request_timeout_seconds) {
+            return Err("request_timeout_seconds must be within 1..=600".to_string());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuredOutputMode {

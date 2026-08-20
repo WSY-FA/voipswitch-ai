@@ -4,7 +4,9 @@ use crate::config::{
 };
 use ai_protocol::control::AiPipelineType;
 use ai_protocol::id::ProviderId;
-use ai_provider::ProviderRegistry;
+use ai_provider::{
+    LocalHttpAsrProvider, OpenAiCompatibleLlmConfig, OpenAiCompatibleLlmProvider, ProviderRegistry,
+};
 use anyhow::{Context, Result, bail};
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
@@ -22,6 +24,33 @@ use std::time::Duration;
 pub struct CatalogStore {
     connection: Mutex<Connection>,
     secret_cipher: Option<SecretCipher>,
+}
+
+impl CatalogStore {
+    pub fn provider_secret(
+        &self,
+        provider_id: &str,
+        kind: GatewayProviderKind,
+    ) -> Result<Option<String>> {
+        let Some(secret_name) = secret_name(kind) else {
+            return Ok(None);
+        };
+        let connection = self.connection.lock().unwrap();
+        let row = connection.query_row("SELECT ciphertext, nonce FROM gateway_provider_secret WHERE provider_id=?1 AND secret_name=?2", params![provider_id, secret_name], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))).optional()?;
+        let Some((ciphertext, nonce)) = row else {
+            return Ok(None);
+        };
+        let cipher = self
+            .secret_cipher
+            .as_ref()
+            .context("AI gateway secret master key is not configured")?;
+        Ok(Some(cipher.decrypt(
+            provider_id,
+            secret_name,
+            &ciphertext,
+            &nonce,
+        )?))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -626,9 +655,71 @@ impl CatalogStore {
     }
 }
 
-pub fn build_provider_registry(catalog: &GatewayCatalog) -> Result<ProviderRegistry> {
-    let _ = catalog;
-    Ok(ProviderRegistry::default())
+pub fn build_provider_registry(
+    store: &CatalogStore,
+    catalog: &GatewayCatalog,
+) -> Result<ProviderRegistry> {
+    let mut registry = ProviderRegistry::default();
+    for provider in &catalog.providers {
+        if !provider.enabled || provider.parameters.validate().is_err() {
+            continue;
+        }
+        let secret = store.provider_secret(&provider.provider_id, provider.kind)?;
+        match (&provider.parameters, provider.kind) {
+            (
+                GatewayProviderParameters::LocalHttpAsr {
+                    base_url,
+                    language,
+                    request_timeout_seconds,
+                },
+                GatewayProviderKind::LocalHttpAsr,
+            ) => {
+                registry
+                    .register_asr(std::sync::Arc::new(LocalHttpAsrProvider::new(
+                        ProviderId::new(provider.provider_id.clone())?,
+                        ai_provider::LocalHttpAsrConfig {
+                            base_url: base_url.clone(),
+                            language: language.clone(),
+                            request_timeout_seconds: *request_timeout_seconds,
+                            enabled: true,
+                        },
+                    )?))
+                    .map_err(anyhow::Error::msg)?;
+            }
+            (
+                GatewayProviderParameters::OpenAiCompatibleLlm {
+                    base_url,
+                    model,
+                    structured_output_mode,
+                    request_timeout_seconds,
+                    max_output_tokens,
+                    temperature,
+                },
+                GatewayProviderKind::OpenAiCompatibleLlm,
+            ) => {
+                let api_key = secret.context("enabled LLM provider secret is not configured")?;
+                let config = OpenAiCompatibleLlmConfig {
+                    base_url: base_url.clone(),
+                    credential_id: "stored-secret".to_string(),
+                    model: model.clone(),
+                    structured_output_mode: *structured_output_mode,
+                    request_timeout_seconds: *request_timeout_seconds,
+                    max_output_tokens: *max_output_tokens,
+                    temperature: *temperature,
+                    enabled: true,
+                };
+                registry
+                    .register_llm(std::sync::Arc::new(OpenAiCompatibleLlmProvider::new(
+                        ProviderId::new(provider.provider_id.clone())?,
+                        config,
+                        api_key,
+                    )?))
+                    .map_err(anyhow::Error::msg)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(registry)
 }
 
 fn runtime_state(
@@ -646,20 +737,26 @@ fn runtime_state(
             Some("provider_parameters_invalid".to_string()),
         );
     }
-    if !secret.configured {
+    if secret_name(_kind).is_some() && !secret.configured {
         return (
             ProviderRuntimeState::Incomplete,
             Some("provider_secret_required".to_string()),
         );
     }
-    (
-        ProviderRuntimeState::AdapterUnavailable,
-        Some("provider_adapter_not_implemented".to_string()),
-    )
+    match _kind {
+        GatewayProviderKind::LocalHttpAsr | GatewayProviderKind::OpenAiCompatibleLlm => {
+            (ProviderRuntimeState::Ready, None)
+        }
+        GatewayProviderKind::VolcengineAsr => (
+            ProviderRuntimeState::AdapterUnavailable,
+            Some("provider_adapter_not_implemented".to_string()),
+        ),
+    }
 }
 
 fn secret_name(kind: GatewayProviderKind) -> Option<&'static str> {
     match kind {
+        GatewayProviderKind::LocalHttpAsr => None,
         GatewayProviderKind::VolcengineAsr => Some("access_token"),
         GatewayProviderKind::OpenAiCompatibleLlm => Some("api_key"),
     }
@@ -749,6 +846,28 @@ impl SecretCipher {
             )
             .map_err(|_| anyhow::anyhow!("encrypt provider secret"))?;
         Ok((ciphertext, nonce.to_vec()))
+    }
+
+    fn decrypt(
+        &self,
+        provider_id: &str,
+        secret_name: &str,
+        ciphertext: &[u8],
+        nonce: &[u8],
+    ) -> Result<String> {
+        let nonce: &[u8; 24] = nonce.try_into().context("invalid secret nonce")?;
+        let associated_data = format!("v1:{provider_id}:{secret_name}");
+        let plaintext = self
+            .cipher
+            .decrypt(
+                XNonce::from_slice(nonce),
+                chacha20poly1305::aead::Payload {
+                    msg: ciphertext,
+                    aad: associated_data.as_bytes(),
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("decrypt provider secret"))?;
+        String::from_utf8(plaintext).context("provider secret is not UTF-8")
     }
 }
 
@@ -948,7 +1067,7 @@ mod tests {
         assert_eq!(catalog.providers.len(), 2);
         assert_eq!(catalog.profiles.len(), 1);
         assert!(
-            build_provider_registry(&catalog)
+            build_provider_registry(&store, &catalog)
                 .unwrap()
                 .asr("mock-asr")
                 .is_none()
@@ -1113,10 +1232,7 @@ mod tests {
             .unwrap();
         assert!(provider.secret.configured);
         assert_eq!(provider.secret.masked.as_deref(), Some("****-key"));
-        assert_eq!(
-            provider.runtime_state,
-            ProviderRuntimeState::AdapterUnavailable
-        );
+        assert_eq!(provider.runtime_state, ProviderRuntimeState::Ready);
         assert!(
             !serde_json::to_string(provider)
                 .unwrap()

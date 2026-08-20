@@ -1,10 +1,13 @@
 mod config;
+mod http;
 mod mock;
 mod registry;
 
 pub use config::{
-    OpenAiCompatibleLlmConfig, StructuredOutputMode, VolcengineApiVariant, VolcengineAsrConfig,
+    LocalHttpAsrConfig, OpenAiCompatibleLlmConfig, StructuredOutputMode, VolcengineApiVariant,
+    VolcengineAsrConfig,
 };
+pub use http::{LocalHttpAsrProvider, OpenAiCompatibleLlmProvider};
 pub use mock::{MockAsrProvider, MockLlmProvider};
 pub use registry::ProviderRegistry;
 
@@ -57,6 +60,9 @@ pub struct AsrAudioInput {
     pub stream_id: StreamId,
     pub participant_id: ParticipantId,
     pub duration_ms: u64,
+    pub codec: ai_protocol::control::AudioCodec,
+    pub sample_rate: u32,
+    pub channels: u8,
     pub payload: Vec<u8>,
 }
 
