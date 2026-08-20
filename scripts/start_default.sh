@@ -5,6 +5,13 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 workspace_dir=$(cd -- "$script_dir/.." && pwd)
 cd "$workspace_dir"
 
+if [[ -f "$workspace_dir/.env.gateway.local" ]]; then
+  set -a
+  # Local provider credentials and the catalog encryption key are never committed.
+  source "$workspace_dir/.env.gateway.local"
+  set +a
+fi
+
 gateway_pid=""
 cleanup() {
   if [[ -n "$gateway_pid" ]]; then
