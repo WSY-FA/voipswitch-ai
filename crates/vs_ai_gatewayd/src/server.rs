@@ -144,6 +144,7 @@ fn dispatch(
             capabilities: vec![
                 "audio_input".to_string(),
                 "post_call_job".to_string(),
+                "voice_agent".to_string(),
                 "durable_result".to_string(),
                 "profile_catalog".to_string(),
             ],
@@ -193,6 +194,12 @@ fn dispatch(
             gateway.result_persisted(&message)?;
             Ok(vec![ControlMessage::JobStatus(gateway.status(&job)?)])
         }
+        ControlMessage::StartConversation(request) => Ok(vec![ControlMessage::ConversationReady(
+            gateway.start_conversation(request)?,
+        )]),
+        ControlMessage::StopConversation(request) => Ok(vec![ControlMessage::ConversationStopped(
+            gateway.stop_conversation(request)?,
+        )]),
         _ => bail!("message type is not accepted from a connector"),
     }
 }

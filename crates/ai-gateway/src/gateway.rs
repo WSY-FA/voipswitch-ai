@@ -6,12 +6,14 @@ use crate::config::{
 };
 use crate::disk::{DiskAdmission, DiskAdmissionGuard, DiskUsage};
 use crate::store::{JobStore, StoredJob};
+use crate::voice_agent::VoiceAgentSession;
 use ai_protocol::control::{
     AiPipelineType, AiProfileProjection, AiProfileSnapshot, AudioInputReady, CaptureQuality,
-    ControlMessage, DurableAccepted, EndAudioInput, JobCompleted, JobRef, JobState, JobStatus,
-    ProfileCatalogSnapshot, ResultPersisted, SubmitPostCallJob,
+    ControlMessage, ConversationReady, ConversationStopped, DurableAccepted, EndAudioInput,
+    JobCompleted, JobRef, JobState, JobStatus, ProfileCatalogSnapshot, ResultPersisted,
+    StartConversation, StopConversation, SubmitPostCallJob,
 };
-use ai_protocol::id::{JobId, ProfileId};
+use ai_protocol::id::{ConversationId, JobId, ProfileId};
 use ai_protocol::media::MediaFrame;
 use ai_protocol::time::unix_timestamp_ms;
 use ai_provider::{
@@ -35,6 +37,7 @@ pub struct Gateway {
     job_tx: mpsc::Sender<JobId>,
     events: broadcast::Sender<ControlMessage>,
     worker_instance_id: String,
+    voice_sessions: Mutex<std::collections::BTreeMap<ConversationId, VoiceAgentSession>>,
 }
 
 impl Gateway {
@@ -69,6 +72,7 @@ impl Gateway {
             job_tx,
             events,
             worker_instance_id,
+            voice_sessions: Mutex::new(std::collections::BTreeMap::new()),
         });
         tokio::spawn(Self::worker_dispatch(gateway.clone(), job_rx));
         tokio::spawn(Self::cleanup_loop(gateway.clone()));
@@ -91,6 +95,36 @@ impl Gateway {
 
     pub fn subscribe(&self) -> broadcast::Receiver<ControlMessage> {
         self.events.subscribe()
+    }
+
+    pub fn start_conversation(&self, request: StartConversation) -> Result<ConversationReady> {
+        request.validate()?;
+        let mut sessions = self.voice_sessions.lock().unwrap();
+        if sessions.contains_key(&request.conversation.conversation_id) {
+            return Ok(ConversationReady {
+                conversation: request.conversation,
+                state: ai_protocol::control::ConversationState::Listening,
+            });
+        }
+        let mut session = VoiceAgentSession::start(request.conversation.clone())?;
+        session.ready()?;
+        let ready = ConversationReady {
+            conversation: request.conversation.clone(),
+            state: session.state(),
+        };
+        sessions.insert(request.conversation.conversation_id, session);
+        Ok(ready)
+    }
+
+    pub fn stop_conversation(&self, request: StopConversation) -> Result<ConversationStopped> {
+        let mut sessions = self.voice_sessions.lock().unwrap();
+        if let Some(mut session) = sessions.remove(&request.conversation.conversation_id) {
+            session.stop()?;
+        }
+        Ok(ConversationStopped {
+            conversation: request.conversation,
+            reason: request.reason,
+        })
     }
 
     pub fn profile_catalog(&self) -> Result<ProfileCatalogSnapshot> {
