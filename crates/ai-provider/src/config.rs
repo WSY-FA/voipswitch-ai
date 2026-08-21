@@ -8,6 +8,29 @@ pub struct LocalHttpAsrConfig {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalHttpTtsConfig {
+    pub base_url: String,
+    pub request_timeout_seconds: u64,
+    pub sample_rate: u32,
+    pub enabled: bool,
+}
+
+impl LocalHttpTtsConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(self.base_url.starts_with("http://") || self.base_url.starts_with("https://")) {
+            return Err("base_url must use http or https".to_string());
+        }
+        if !(1..=600).contains(&self.request_timeout_seconds) {
+            return Err("request_timeout_seconds must be within 1..=600".to_string());
+        }
+        if !matches!(self.sample_rate, 8000 | 16000) {
+            return Err("sample_rate must be 8000 or 16000".to_string());
+        }
+        Ok(())
+    }
+}
+
 impl LocalHttpAsrConfig {
     pub fn validate(&self) -> Result<(), String> {
         if !(self.base_url.starts_with("http://") || self.base_url.starts_with("https://")) {

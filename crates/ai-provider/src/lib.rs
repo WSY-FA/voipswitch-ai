@@ -4,10 +4,10 @@ mod mock;
 mod registry;
 
 pub use config::{
-    LocalHttpAsrConfig, OpenAiCompatibleLlmConfig, StructuredOutputMode, VolcengineApiVariant,
-    VolcengineAsrConfig,
+    LocalHttpAsrConfig, LocalHttpTtsConfig, OpenAiCompatibleLlmConfig, StructuredOutputMode,
+    VolcengineApiVariant, VolcengineAsrConfig,
 };
-pub use http::{LocalHttpAsrProvider, OpenAiCompatibleLlmProvider};
+pub use http::{LocalHttpAsrProvider, LocalHttpTtsProvider, OpenAiCompatibleLlmProvider};
 pub use mock::{MockAsrProvider, MockLlmProvider};
 pub use registry::ProviderRegistry;
 

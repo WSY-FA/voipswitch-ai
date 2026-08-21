@@ -1,11 +1,12 @@
-use crate::config::LocalHttpAsrConfig;
+use crate::config::{LocalHttpAsrConfig, LocalHttpTtsConfig};
 use crate::{
     AsrAudioInput, AsrOutput, AsrProvider, AsrRequest, LlmOutput, LlmProvider, LlmRequest,
     OpenAiCompatibleLlmConfig, ProviderError, ProviderErrorKind, ProviderId, ProviderResult,
-    StructuredOutputMode,
+    StructuredOutputMode, TtsOutput, TtsProvider, TtsRequest,
 };
 use ai_protocol::control::{StructuredCallResult, TranscriptSegment};
 use async_trait::async_trait;
+use base64::Engine;
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -111,6 +112,74 @@ pub struct LocalHttpAsrProvider {
     provider_id: ProviderId,
     config: LocalHttpAsrConfig,
     client: reqwest::Client,
+}
+
+pub struct LocalHttpTtsProvider {
+    provider_id: ProviderId,
+    config: LocalHttpTtsConfig,
+    client: reqwest::Client,
+}
+
+impl LocalHttpTtsProvider {
+    pub fn new(provider_id: ProviderId, config: LocalHttpTtsConfig) -> ProviderResult<Self> {
+        config.validate().map_err(invalid_config)?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.request_timeout_seconds))
+            .build()
+            .map_err(|error| transport_error(format!("build HTTP client: {error}")))?;
+        Ok(Self {
+            provider_id,
+            config,
+            client,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalTtsResponse {
+    audio_base64: String,
+    sample_rate: Option<u32>,
+}
+
+#[async_trait]
+impl TtsProvider for LocalHttpTtsProvider {
+    fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    async fn synthesize(&self, request: TtsRequest) -> ProviderResult<TtsOutput> {
+        if request.text.trim().is_empty() {
+            return Err(invalid_request("TTS text is empty"));
+        }
+        let response = self
+            .client
+            .post(format!(
+                "{}/tts",
+                self.config.base_url.trim_end_matches('/')
+            ))
+            .json(&serde_json::json!({"text": request.text, "voice": request.voice}))
+            .send()
+            .await
+            .map_err(|error| transport_error(error.to_string()))?;
+        let status = response.status();
+        let payload: LocalTtsResponse = response
+            .json()
+            .await
+            .map_err(|error| invalid_response(error.to_string()))?;
+        if !status.is_success() {
+            return Err(http_status(status.as_u16(), &serde_json::Value::Null));
+        }
+        let pcm16_le = base64::engine::general_purpose::STANDARD
+            .decode(payload.audio_base64)
+            .map_err(|error| invalid_response(format!("invalid TTS audio: {error}")))?;
+        if pcm16_le.is_empty() || pcm16_le.len() % 2 != 0 {
+            return Err(invalid_response("TTS audio must be non-empty PCM16LE"));
+        }
+        Ok(TtsOutput {
+            pcm16_le,
+            sample_rate: payload.sample_rate.unwrap_or(self.config.sample_rate),
+        })
+    }
 }
 
 impl LocalHttpAsrProvider {

@@ -46,7 +46,116 @@ pub enum ControlMessage {
     JobStatusRequest(JobStatusRequest),
     JobStatus(JobStatus),
     JobResultRequest(JobResultRequest),
+    StartConversation(StartConversation),
+    ConversationReady(ConversationReady),
+    StopConversation(StopConversation),
+    ConversationStopped(ConversationStopped),
+    ActionRequested(ActionRequested),
+    ActionResult(ActionResult),
+    TtsStateChanged(TtsStateChanged),
     Error(ProtocolError),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StartConversation {
+    pub conversation: JobRef,
+    pub profile: AiProfileSnapshot,
+    pub participant: Participant,
+    pub input_stream: StreamBinding,
+}
+
+impl StartConversation {
+    pub fn validate(&self) -> Result<()> {
+        self.profile.validate()?;
+        if self.profile.pipeline_type != AiPipelineType::VoiceAgent {
+            bail!("conversation requires a voice_agent profile");
+        }
+        if self.conversation.generation == 0 {
+            bail!("conversation generation must be greater than zero");
+        }
+        if self.input_stream.participant_id != self.participant.participant_id {
+            bail!("conversation stream participant mismatch");
+        }
+        if self.input_stream.direction != MediaDirection::FromParticipant {
+            bail!("conversation input stream must be from participant");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationReady {
+    pub conversation: JobRef,
+    pub state: ConversationState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopConversation {
+    pub conversation: JobRef,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationStopped {
+    pub conversation: JobRef,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationState {
+    Starting,
+    Listening,
+    Thinking,
+    Speaking,
+    Stopping,
+    Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionRequested {
+    pub conversation: JobRef,
+    pub operation_id: OperationId,
+    pub generation: u64,
+    pub action: AgentAction,
+    pub deadline_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentAction {
+    PlayText { text: String, voice: String },
+    CollectDigits { max_digits: u8, timeout_ms: u64 },
+    TransferToExtension { number: String },
+    TransferToBusinessTarget { target: String },
+    EndCall { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionResult {
+    pub conversation: JobRef,
+    pub operation_id: OperationId,
+    pub generation: u64,
+    pub success: bool,
+    pub code: String,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TtsStateChanged {
+    pub conversation: JobRef,
+    pub generation: u64,
+    pub state: TtsState,
+    pub sample_rate: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TtsState {
+    Started,
+    Stopped,
+    Interrupted,
+    Failed,
 }
 
 impl ControlMessage {
@@ -54,6 +163,7 @@ impl ControlMessage {
         match self {
             Self::SubmitPostCallJob(request) => request.validate(),
             Self::ProfileCatalogSnapshot(snapshot) => snapshot.validate(),
+            Self::StartConversation(request) => request.validate(),
             Self::EndAudioInput(request) if request.final_sequences.is_empty() => {
                 bail!("end_audio_input requires at least one final sequence")
             }
