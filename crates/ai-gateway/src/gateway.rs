@@ -8,16 +8,18 @@ use crate::disk::{DiskAdmission, DiskAdmissionGuard, DiskUsage};
 use crate::store::{JobStore, StoredJob};
 use crate::voice_agent::VoiceAgentSession;
 use ai_protocol::control::{
-    AiPipelineType, AiProfileProjection, AiProfileSnapshot, AudioInputReady, CaptureQuality,
-    ControlMessage, ConversationReady, ConversationStopped, DurableAccepted, EndAudioInput,
-    JobCompleted, JobRef, JobState, JobStatus, ProfileCatalogSnapshot, ResultPersisted,
-    StartConversation, StopConversation, SubmitPostCallJob,
+    ActionRequested, AiPipelineType, AiProfileProjection, AiProfileSnapshot, AudioInputReady,
+    CaptureQuality, ControlMessage, ConversationReady, ConversationStopped, DurableAccepted,
+    EndAudioInput, JobCompleted, JobRef, JobState, JobStatus, ProfileCatalogSnapshot,
+    ResultPersisted, StartConversation, StopConversation, SubmitPostCallJob, TtsState,
+    TtsStateChanged,
 };
 use ai_protocol::id::{ConversationId, JobId, ProfileId};
-use ai_protocol::media::MediaFrame;
+use ai_protocol::media::{MediaFrame, MediaFrameMetadata};
 use ai_protocol::time::unix_timestamp_ms;
 use ai_provider::{
     AsrAudioInput, AsrRequest, LlmRequest, ProviderError, ProviderRegistry, ProviderResult,
+    TtsRequest,
 };
 use anyhow::{Context, Result, bail};
 use std::future::Future;
@@ -37,8 +39,38 @@ pub struct Gateway {
     job_tx: mpsc::Sender<JobId>,
     events: broadcast::Sender<ControlMessage>,
     worker_instance_id: String,
-    voice_sessions: Mutex<std::collections::BTreeMap<ConversationId, VoiceAgentSession>>,
+    voice_sessions: Arc<Mutex<std::collections::BTreeMap<ConversationId, VoiceConversation>>>,
+    media_events: broadcast::Sender<MediaFrame>,
 }
+
+/// Per-conversation state is intentionally in-memory.  The Core owns call lifetime and will
+/// start a fresh generation after a connector restart; provider secrets and PBX state never
+/// enter this structure.
+struct VoiceConversation {
+    session: VoiceAgentSession,
+    profile: AiProfileSnapshot,
+    participant: ai_protocol::control::Participant,
+    input_stream: ai_protocol::control::StreamBinding,
+    buffered_frames: Vec<MediaFrame>,
+    speech_frames: u16,
+    silent_frames: u16,
+    next_output_sequence: u64,
+}
+
+struct VoiceTurn {
+    conversation: JobRef,
+    profile: AiProfileSnapshot,
+    participant: ai_protocol::control::Participant,
+    input_stream: ai_protocol::control::StreamBinding,
+    frames: Vec<MediaFrame>,
+    playback_generation: u64,
+    first_timestamp: u64,
+    output_sequence: u64,
+}
+
+const VAD_MIN_SPEECH_FRAMES: u16 = 5;
+const VAD_END_SILENCE_FRAMES: u16 = 10;
+const VAD_MAX_BUFFERED_FRAMES: usize = 1_500;
 
 impl Gateway {
     pub fn open(
@@ -61,6 +93,7 @@ impl Gateway {
         let capture = Arc::new(CaptureStore::new(config.data_dir.join("captures"))?);
         let (job_tx, job_rx) = mpsc::channel(config.worker_queue_capacity);
         let (events, _) = broadcast::channel(config.worker_queue_capacity);
+        let (media_events, _) = broadcast::channel(config.worker_queue_capacity * 4);
         let gateway = Arc::new(Self {
             config,
             catalog,
@@ -72,7 +105,8 @@ impl Gateway {
             job_tx,
             events,
             worker_instance_id,
-            voice_sessions: Mutex::new(std::collections::BTreeMap::new()),
+            voice_sessions: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            media_events,
         });
         tokio::spawn(Self::worker_dispatch(gateway.clone(), job_rx));
         tokio::spawn(Self::cleanup_loop(gateway.clone()));
@@ -97,8 +131,15 @@ impl Gateway {
         self.events.subscribe()
     }
 
+    /// TTS is sent only over the local media socket.  It is deliberately separate from the
+    /// control broadcast so a slow RTP consumer cannot delay call/session events.
+    pub fn subscribe_media(&self) -> broadcast::Receiver<MediaFrame> {
+        self.media_events.subscribe()
+    }
+
     pub fn start_conversation(&self, request: StartConversation) -> Result<ConversationReady> {
         request.validate()?;
+        info!(conversation_id = %request.conversation.conversation_id, job_id = %request.conversation.job_id, profile_id = %request.profile.profile_id, "voice-agent conversation started");
         let mut sessions = self.voice_sessions.lock().unwrap();
         if sessions.contains_key(&request.conversation.conversation_id) {
             return Ok(ConversationReady {
@@ -112,14 +153,26 @@ impl Gateway {
             conversation: request.conversation.clone(),
             state: session.state(),
         };
-        sessions.insert(request.conversation.conversation_id, session);
+        sessions.insert(
+            request.conversation.conversation_id,
+            VoiceConversation {
+                session,
+                profile: request.profile,
+                participant: request.participant,
+                input_stream: request.input_stream,
+                buffered_frames: Vec::new(),
+                speech_frames: 0,
+                silent_frames: 0,
+                next_output_sequence: 1,
+            },
+        );
         Ok(ready)
     }
 
     pub fn stop_conversation(&self, request: StopConversation) -> Result<ConversationStopped> {
         let mut sessions = self.voice_sessions.lock().unwrap();
         if let Some(mut session) = sessions.remove(&request.conversation.conversation_id) {
-            session.stop()?;
+            session.session.stop()?;
         }
         Ok(ConversationStopped {
             conversation: request.conversation,
@@ -148,15 +201,33 @@ impl Gateway {
                     capture_complete_max_gap_ms: profile.capture.complete_max_gap_ms,
                     capture_process_max_gap_ms: profile.capture.process_max_gap_ms,
                 };
-                let executable = profile.pipeline_type == AiPipelineType::PostCallAnalysis
-                    && profile
-                        .asr_provider_id
-                        .as_deref()
-                        .is_some_and(|id| providers.asr(id).is_some())
-                    && profile
-                        .llm_provider_id
-                        .as_deref()
-                        .is_some_and(|id| providers.llm(id).is_some());
+                let executable = match profile.pipeline_type {
+                    AiPipelineType::PostCallAnalysis => {
+                        profile
+                            .asr_provider_id
+                            .as_deref()
+                            .is_some_and(|id| providers.asr(id).is_some())
+                            && profile
+                                .llm_provider_id
+                                .as_deref()
+                                .is_some_and(|id| providers.llm(id).is_some())
+                    }
+                    AiPipelineType::VoiceAgent => {
+                        profile
+                            .asr_provider_id
+                            .as_deref()
+                            .is_some_and(|id| providers.asr(id).is_some())
+                            && profile
+                                .llm_provider_id
+                                .as_deref()
+                                .is_some_and(|id| providers.llm(id).is_some())
+                            && profile
+                                .tts_provider_id
+                                .as_deref()
+                                .is_some_and(|id| providers.tts(id).is_some())
+                    }
+                    _ => false,
+                };
                 anyhow::Ok(AiProfileProjection {
                     profile: snapshot,
                     enabled: profile.enabled,
@@ -279,6 +350,16 @@ impl Gateway {
 
     pub fn ingest_media(&self, frame: MediaFrame) -> Result<()> {
         frame.validate()?;
+        if frame.metadata.sequence <= 2 {
+            info!(conversation_id = %frame.metadata.conversation_id, sequence = frame.metadata.sequence, direction = ?frame.metadata.direction, "voice-agent media frame received");
+        }
+        let (is_voice_conversation, turn) = self.ingest_voice_media(&frame)?;
+        if let Some(turn) = turn {
+            self.spawn_voice_turn(turn);
+        }
+        if is_voice_conversation {
+            return Ok(());
+        }
         let _guard = self.ingest_lock.lock().unwrap();
         let mut stored = self.store.load(&frame.metadata.job_id)?;
         if stored.state != JobState::Capturing {
@@ -294,6 +375,93 @@ impl Gateway {
             &stored.manifest,
             unix_timestamp_ms(),
         )
+    }
+
+    fn ingest_voice_media(&self, frame: &MediaFrame) -> Result<(bool, Option<VoiceTurn>)> {
+        let mut sessions = self.voice_sessions.lock().unwrap();
+        let Some(conversation) = sessions.get_mut(&frame.metadata.conversation_id) else {
+            return Ok((false, None));
+        };
+        if frame.metadata.job_id != conversation.session.conversation.job_id
+            || frame.metadata.tenant_id != conversation.session.conversation.tenant_id
+            || frame.metadata.generation != conversation.session.conversation.generation
+            || frame.metadata.direction != ai_protocol::control::MediaDirection::FromParticipant
+            || frame.metadata.participant_id != conversation.input_stream.participant_id
+            || frame.metadata.stream_id != conversation.input_stream.stream_id
+        {
+            bail!("voice conversation media identity does not match its input stream");
+        }
+        if conversation.session.state() == ai_protocol::control::ConversationState::Speaking
+            && frame_has_voice(frame)
+        {
+            let generation = conversation.session.barge_in()?;
+            info!(conversation_id = %frame.metadata.conversation_id, generation, "voice-agent barge-in interrupted TTS");
+            let _ = self
+                .events
+                .send(ControlMessage::TtsStateChanged(TtsStateChanged {
+                    conversation: conversation.session.conversation.clone(),
+                    generation,
+                    state: TtsState::Interrupted,
+                    sample_rate: None,
+                }));
+        }
+        if conversation.session.state() != ai_protocol::control::ConversationState::Listening {
+            return Ok((true, None));
+        }
+        let voice = frame_has_voice(frame);
+        if voice {
+            conversation.speech_frames = conversation.speech_frames.saturating_add(1);
+            conversation.silent_frames = 0;
+        } else if conversation.speech_frames > 0 {
+            conversation.silent_frames = conversation.silent_frames.saturating_add(1);
+        }
+        if conversation.speech_frames > 0 {
+            conversation.buffered_frames.push(frame.clone());
+            if conversation.buffered_frames.len() > VAD_MAX_BUFFERED_FRAMES {
+                conversation.buffered_frames.remove(0);
+            }
+        }
+        if conversation.speech_frames < VAD_MIN_SPEECH_FRAMES
+            || conversation.silent_frames < VAD_END_SILENCE_FRAMES
+        {
+            return Ok((true, None));
+        }
+        conversation.session.begin_thinking()?;
+        let frames = std::mem::take(&mut conversation.buffered_frames);
+        conversation.speech_frames = 0;
+        conversation.silent_frames = 0;
+        let first_timestamp = frames
+            .first()
+            .map_or(0, |item| item.metadata.media_timestamp);
+        let playback_generation = conversation.session.playback_generation;
+        let output_sequence = conversation.next_output_sequence;
+        Ok((
+            true,
+            Some(VoiceTurn {
+                conversation: conversation.session.conversation.clone(),
+                profile: conversation.profile.clone(),
+                participant: conversation.participant.clone(),
+                input_stream: conversation.input_stream.clone(),
+                frames,
+                playback_generation,
+                first_timestamp,
+                output_sequence,
+            }),
+        ))
+    }
+
+    fn spawn_voice_turn(&self, turn: VoiceTurn) {
+        let providers = self.providers.read().unwrap().clone();
+        let events = self.events.clone();
+        let media_events = self.media_events.clone();
+        let sessions = self.voice_sessions.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                execute_voice_turn(turn, providers, events.clone(), media_events, sessions).await
+            {
+                warn!(error = %error, "voice-agent turn failed");
+            }
+        });
     }
 
     pub fn end_audio(&self, request: EndAudioInput) -> Result<()> {
@@ -615,6 +783,7 @@ impl Gateway {
             let request = LlmRequest {
                 operation_id: format!("{}:llm:{attempt}", stored.request.job.operation_id),
                 transcript: transcript.clone(),
+                allow_actions: false,
             };
             match self
                 .provider_call(
@@ -745,6 +914,227 @@ fn validate_media_identity(stored: &StoredJob, frame: &MediaFrame) -> Result<()>
         || metadata.generation != job.generation
     {
         bail!("media frame identity does not match durable job");
+    }
+    Ok(())
+}
+
+fn frame_has_voice(frame: &MediaFrame) -> bool {
+    // G.711 zero/silence is codec dependent.  Count deviations from the common silence octets
+    // rather than decoding in the RTP hot path; the provider still receives the original audio.
+    let non_silence = match frame.metadata.codec {
+        ai_protocol::control::AudioCodec::Pcma => frame
+            .payload
+            .iter()
+            .filter(|sample| **sample != 0xd5 && **sample != 0x55)
+            .count(),
+        ai_protocol::control::AudioCodec::Pcmu => frame
+            .payload
+            .iter()
+            .filter(|sample| **sample != 0xff && **sample != 0x7f)
+            .count(),
+        ai_protocol::control::AudioCodec::Pcm16Le => frame
+            .payload
+            .chunks_exact(2)
+            .filter(|sample| i16::from_le_bytes([sample[0], sample[1]]).unsigned_abs() > 500)
+            .count(),
+    };
+    non_silence.saturating_mul(10) >= frame.payload.len().max(1)
+}
+
+async fn execute_voice_turn(
+    turn: VoiceTurn,
+    providers: Arc<ProviderRegistry>,
+    events: broadcast::Sender<ControlMessage>,
+    media_events: broadcast::Sender<MediaFrame>,
+    sessions: Arc<Mutex<std::collections::BTreeMap<ConversationId, VoiceConversation>>>,
+) -> Result<()> {
+    let asr_id = turn
+        .profile
+        .asr_provider_id
+        .as_deref()
+        .context("voice-agent ASR provider missing")?;
+    let llm_id = turn
+        .profile
+        .llm_provider_id
+        .as_deref()
+        .context("voice-agent LLM provider missing")?;
+    let tts_id = turn
+        .profile
+        .tts_provider_id
+        .as_deref()
+        .context("voice-agent TTS provider missing")?;
+    let asr = providers
+        .asr(asr_id)
+        .context("voice-agent ASR provider unavailable")?;
+    let llm = providers
+        .llm(llm_id)
+        .context("voice-agent LLM provider unavailable")?;
+    let tts = providers
+        .tts(tts_id)
+        .context("voice-agent TTS provider unavailable")?;
+    let duration_ms = turn
+        .frames
+        .iter()
+        .map(|frame| u64::from(frame.metadata.duration_ms))
+        .sum();
+    let payload = turn
+        .frames
+        .iter()
+        .flat_map(|frame| frame.payload.iter().copied())
+        .collect();
+    let transcript = asr
+        .transcribe(AsrRequest {
+            operation_id: format!(
+                "{}-asr-{}",
+                turn.conversation.operation_id, turn.playback_generation
+            ),
+            language: None,
+            streams: vec![AsrAudioInput {
+                stream_id: turn.input_stream.stream_id.clone(),
+                participant_id: turn.participant.participant_id.clone(),
+                duration_ms,
+                codec: turn.input_stream.codec,
+                sample_rate: turn.input_stream.sample_rate,
+                channels: turn.input_stream.channels,
+                payload,
+            }],
+        })
+        .await
+        .map_err(anyhow::Error::from)?;
+    info!(conversation_id = %turn.conversation.conversation_id, generation = turn.playback_generation, "voice-agent ASR completed");
+    let llm_output = llm
+        .summarize(LlmRequest {
+            operation_id: format!(
+                "{}-llm-{}",
+                turn.conversation.operation_id, turn.playback_generation
+            ),
+            transcript: transcript.segments,
+            allow_actions: true,
+        })
+        .await
+        .map_err(anyhow::Error::from)?;
+    info!(conversation_id = %turn.conversation.conversation_id, generation = turn.playback_generation, "voice-agent LLM completed");
+    if let Some(action) = llm_output.result.action.clone() {
+        let action_request = ActionRequested {
+            conversation: turn.conversation.clone(),
+            operation_id: ai_protocol::id::OperationId::new(format!(
+                "{}:action:{}",
+                turn.conversation.operation_id, turn.playback_generation
+            ))?,
+            generation: turn.conversation.generation,
+            action,
+            deadline_at_ms: unix_timestamp_ms().saturating_add(30_000),
+        };
+        let _ = events.send(ControlMessage::ActionRequested(action_request));
+        info!(conversation_id = %turn.conversation.conversation_id, generation = turn.playback_generation, "voice-agent action requested");
+    }
+    let text = llm_output.result.summary;
+    if text.trim().is_empty() {
+        bail!("voice-agent LLM returned an empty response");
+    }
+    let audio = tts
+        .synthesize(TtsRequest {
+            operation_id: format!(
+                "{}-tts-{}",
+                turn.conversation.operation_id, turn.playback_generation
+            ),
+            text,
+            voice: String::new(),
+        })
+        .await
+        .map_err(anyhow::Error::from)?;
+    info!(conversation_id = %turn.conversation.conversation_id, generation = turn.playback_generation, sample_rate = audio.sample_rate, pcm_bytes = audio.pcm16_le.len(), "voice-agent TTS completed");
+    if audio.sample_rate != 16_000
+        || audio.pcm16_le.is_empty()
+        || !audio.pcm16_le.len().is_multiple_of(2)
+    {
+        bail!("voice-agent TTS must return non-empty PCM16LE at 16000 Hz");
+    }
+    let (generation, mut sequence) = {
+        let mut sessions = sessions.lock().unwrap();
+        let session = sessions
+            .get_mut(&turn.conversation.conversation_id)
+            .context("voice conversation stopped before TTS completed")?;
+        if session.session.conversation != turn.conversation
+            || session.session.state() != ai_protocol::control::ConversationState::Thinking
+        {
+            bail!("voice conversation generation is stale before TTS playback");
+        }
+        let generation = session.session.begin_speaking()?;
+        let sequence = session.next_output_sequence.max(turn.output_sequence);
+        session.next_output_sequence = sequence;
+        (generation, sequence)
+    };
+    let _ = events.send(ControlMessage::TtsStateChanged(TtsStateChanged {
+        conversation: turn.conversation.clone(),
+        generation,
+        state: TtsState::Started,
+        sample_rate: Some(16_000),
+    }));
+    let output_stream =
+        ai_protocol::id::StreamId::new(format!("{}-tts", turn.input_stream.stream_id.as_str()))?;
+    let frame_bytes = 640; // 20 ms * 16 kHz * mono * PCM16LE
+    for (offset, payload) in audio.pcm16_le.chunks(frame_bytes).enumerate() {
+        let still_speaking = {
+            let sessions = sessions.lock().unwrap();
+            sessions
+                .get(&turn.conversation.conversation_id)
+                .is_some_and(|session| {
+                    session.session.playback_generation == generation
+                        && session.session.state()
+                            == ai_protocol::control::ConversationState::Speaking
+                })
+        };
+        if !still_speaking {
+            return Ok(());
+        }
+        let frame = MediaFrame {
+            metadata: MediaFrameMetadata {
+                job_id: turn.conversation.job_id.clone(),
+                tenant_id: turn.conversation.tenant_id.clone(),
+                conversation_id: turn.conversation.conversation_id.clone(),
+                participant_id: turn.participant.participant_id.clone(),
+                stream_id: output_stream.clone(),
+                sequence,
+                generation,
+                direction: ai_protocol::control::MediaDirection::ToParticipant,
+                codec: ai_protocol::control::AudioCodec::Pcm16Le,
+                sample_rate: 16_000,
+                channels: 1,
+                media_timestamp: turn.first_timestamp.saturating_add((offset as u64) * 320),
+                duration_ms: 20,
+                end_of_stream: false,
+            },
+            payload: payload.to_vec(),
+        };
+        if media_events.send(frame).is_err() {
+            bail!("voice-agent media consumer is unavailable");
+        }
+        sequence = sequence.saturating_add(1);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let completed = {
+        let mut sessions = sessions.lock().unwrap();
+        let session = sessions
+            .get_mut(&turn.conversation.conversation_id)
+            .context("voice conversation stopped during TTS playback")?;
+        if session.session.playback_generation != generation
+            || session.session.state() != ai_protocol::control::ConversationState::Speaking
+        {
+            false
+        } else {
+            session.next_output_sequence = sequence;
+            session.session.ready()?;
+            true
+        }
+    };
+    if completed {
+        let _ = events.send(ControlMessage::TtsStateChanged(TtsStateChanged {
+            conversation: turn.conversation,
+            generation,
+            state: TtsState::Stopped,
+            sample_rate: Some(16_000),
+        }));
     }
     Ok(())
 }

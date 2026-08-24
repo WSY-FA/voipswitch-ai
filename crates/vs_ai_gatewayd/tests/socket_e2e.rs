@@ -3,15 +3,15 @@ use ai_protocol::PROTOCOL_VERSION;
 use ai_protocol::control::{
     AiPipelineType, AiProfileSnapshot, AudioCodec, ConnectorHello, ControlEnvelope, ControlMessage,
     EndAudioInput, JobRef, MediaDirection, Participant, ProfileCatalogRequest, ResultPersisted,
-    StreamBinding, SubmitPostCallJob,
+    StartConversation, StreamBinding, SubmitPostCallJob,
 };
 use ai_protocol::frame::{read_json_frame, write_json_frame};
 use ai_protocol::id::{
     ConnectorInstanceId, ConversationId, JobId, MessageId, OperationId, ParticipantId, ProfileId,
     ProviderId, StreamId, TenantId,
 };
-use ai_protocol::media::{MediaFrame, MediaFrameMetadata, write_media_frame};
-use ai_provider::{MockAsrProvider, MockLlmProvider, ProviderRegistry};
+use ai_protocol::media::{MediaFrame, MediaFrameMetadata, read_media_frame, write_media_frame};
+use ai_provider::{MockAsrProvider, MockLlmProvider, MockTtsProvider, ProviderRegistry};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -188,6 +188,158 @@ fn providers() -> ProviderRegistry {
         )))
         .unwrap();
     providers
+}
+
+#[tokio::test]
+async fn media_socket_returns_voice_agent_tts_on_the_same_connection() {
+    let directory = tempdir().unwrap();
+    let control_path = directory.path().join("control.sock");
+    let media_path = directory.path().join("media.sock");
+    let mut config = GatewayConfig::with_data_dir(directory.path().join("data"));
+    config.storage.disk_min_free_mb = 1;
+    config.profiles = vec![GatewayProfileConfig {
+        profile_id: "voice-profile".to_string(),
+        profile_version: 1,
+        enabled: true,
+        pipeline_type: AiPipelineType::VoiceAgent,
+        asr_provider_id: Some("mock-asr".to_string()),
+        llm_provider_id: Some("mock-llm".to_string()),
+        tts_provider_id: Some("mock-tts".to_string()),
+        capture: Default::default(),
+    }];
+    let mut registry = providers();
+    registry
+        .register_tts(Arc::new(MockTtsProvider::new(
+            ProviderId::new("mock-tts").unwrap(),
+        )))
+        .unwrap();
+    let gateway =
+        ai_gateway::Gateway::open(config, Arc::new(registry), "voice-socket".to_string()).unwrap();
+    let control = tokio::spawn(vs_ai_gatewayd::server::run_control_socket(
+        gateway.clone(),
+        control_path.clone(),
+    ));
+    let media = tokio::spawn(vs_ai_gatewayd::server::run_media_socket(
+        gateway,
+        media_path.clone(),
+    ));
+    wait_for_socket(&control_path).await;
+    wait_for_socket(&media_path).await;
+
+    let mut control_client = UnixStream::connect(&control_path).await.unwrap();
+    send(
+        &mut control_client,
+        1,
+        ControlMessage::ConnectorHello(ConnectorHello {
+            connector_instance_id: ConnectorInstanceId::new("voice-connector").unwrap(),
+            connector_kind: "test".to_string(),
+            supported_versions: vec![PROTOCOL_VERSION],
+            capabilities: vec!["voice_agent".to_string()],
+        }),
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut control_client).await,
+        ControlMessage::GatewayHello(_)
+    ));
+    let job = JobRef {
+        job_id: JobId::new("voice-job").unwrap(),
+        tenant_id: TenantId::new("tenant-1").unwrap(),
+        conversation_id: ConversationId::new("voice-call").unwrap(),
+        operation_id: OperationId::new("voice-agent-v1").unwrap(),
+        generation: 1,
+    };
+    send(
+        &mut control_client,
+        2,
+        ControlMessage::StartConversation(StartConversation {
+            conversation: job.clone(),
+            profile: voice_profile(),
+            participant: Participant {
+                participant_id: ParticipantId::new("caller").unwrap(),
+                role: "caller".to_string(),
+                display_number: Some("1001".to_string()),
+            },
+            input_stream: StreamBinding {
+                stream_id: StreamId::new("caller-audio").unwrap(),
+                participant_id: ParticipantId::new("caller").unwrap(),
+                direction: MediaDirection::FromParticipant,
+                codec: AudioCodec::Pcma,
+                sample_rate: 8_000,
+                channels: 1,
+            },
+        }),
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut control_client).await,
+        ControlMessage::ConversationReady(_)
+    ));
+    let mut media_client = UnixStream::connect(&media_path).await.unwrap();
+    for sequence in 0..5 {
+        write_media_frame(
+            &mut media_client,
+            &voice_frame(&job, sequence, vec![0; 160]),
+        )
+        .await
+        .unwrap();
+    }
+    for sequence in 5..15 {
+        write_media_frame(
+            &mut media_client,
+            &voice_frame(&job, sequence, vec![0xd5; 160]),
+        )
+        .await
+        .unwrap();
+    }
+    let tts = tokio::time::timeout(Duration::from_secs(3), read_media_frame(&mut media_client))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tts.metadata.direction, MediaDirection::ToParticipant);
+    assert_eq!(tts.metadata.codec, AudioCodec::Pcm16Le);
+    assert_eq!(tts.metadata.sample_rate, 16_000);
+    assert_eq!(tts.payload.len(), 640);
+
+    control.abort();
+    media.abort();
+}
+
+fn voice_profile() -> AiProfileSnapshot {
+    AiProfileSnapshot {
+        profile_id: ProfileId::new("voice-profile").unwrap(),
+        profile_version: 1,
+        pipeline_type: AiPipelineType::VoiceAgent,
+        asr_provider_id: Some("mock-asr".to_string()),
+        llm_provider_id: Some("mock-llm".to_string()),
+        tts_provider_id: Some("mock-tts".to_string()),
+        capture_complete_ratio: 0.995,
+        capture_process_min_ratio: 0.95,
+        capture_complete_max_gap_ms: 200,
+        capture_process_max_gap_ms: 5_000,
+    }
+}
+
+fn voice_frame(job: &JobRef, sequence: u64, payload: Vec<u8>) -> MediaFrame {
+    MediaFrame {
+        metadata: MediaFrameMetadata {
+            job_id: job.job_id.clone(),
+            tenant_id: job.tenant_id.clone(),
+            conversation_id: job.conversation_id.clone(),
+            participant_id: ParticipantId::new("caller").unwrap(),
+            stream_id: StreamId::new("caller-audio").unwrap(),
+            sequence,
+            generation: job.generation,
+            direction: MediaDirection::FromParticipant,
+            codec: AudioCodec::Pcma,
+            sample_rate: 8_000,
+            channels: 1,
+            media_timestamp: sequence * 160,
+            duration_ms: 20,
+            end_of_stream: false,
+        },
+        payload,
+    }
 }
 
 fn request() -> SubmitPostCallJob {

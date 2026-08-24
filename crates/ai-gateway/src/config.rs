@@ -1,8 +1,8 @@
 use ai_protocol::control::AiPipelineType;
 use ai_protocol::id::ProfileId;
 use ai_provider::{
-    LocalHttpAsrConfig, OpenAiCompatibleLlmConfig, StructuredOutputMode, VolcengineApiVariant,
-    VolcengineAsrConfig,
+    ByteDanceTtsConfig, LocalHttpAsrConfig, OpenAiCompatibleLlmConfig, StructuredOutputMode,
+    VolcengineApiVariant, VolcengineAsrConfig,
 };
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -121,6 +121,16 @@ pub enum GatewayProviderParameters {
         max_output_tokens: u32,
         temperature: f32,
     },
+    ByteDanceTts {
+        endpoint: String,
+        app_id: String,
+        cluster: String,
+        voice_type: String,
+        uid: String,
+        language: String,
+        sample_rate: u32,
+        request_timeout_seconds: u64,
+    },
 }
 
 impl GatewayProviderParameters {
@@ -150,6 +160,16 @@ impl GatewayProviderParameters {
                 max_output_tokens: 2_048,
                 temperature: 0.2,
             },
+            GatewayProviderKind::ByteDanceTts => Self::ByteDanceTts {
+                endpoint: "https://openspeech.bytedance.com/api/v1/tts".to_string(),
+                app_id: String::new(),
+                cluster: "volcano_tts".to_string(),
+                voice_type: "BV001_streaming".to_string(),
+                uid: "voipswitch".to_string(),
+                language: "zh".to_string(),
+                sample_rate: 16000,
+                request_timeout_seconds: 60,
+            },
         }
     }
 
@@ -158,6 +178,7 @@ impl GatewayProviderParameters {
             Self::LocalHttpAsr { .. } => GatewayProviderKind::LocalHttpAsr,
             Self::VolcengineAsr { .. } => GatewayProviderKind::VolcengineAsr,
             Self::OpenAiCompatibleLlm { .. } => GatewayProviderKind::OpenAiCompatibleLlm,
+            Self::ByteDanceTts { .. } => GatewayProviderKind::ByteDanceTts,
         }
     }
 
@@ -219,6 +240,28 @@ impl GatewayProviderParameters {
             }
             .validate()
             .map_err(anyhow::Error::msg),
+            Self::ByteDanceTts {
+                endpoint,
+                app_id,
+                cluster,
+                voice_type,
+                uid,
+                language,
+                sample_rate,
+                request_timeout_seconds,
+            } => ByteDanceTtsConfig {
+                endpoint: endpoint.clone(),
+                app_id: app_id.clone(),
+                cluster: cluster.clone(),
+                voice_type: voice_type.clone(),
+                uid: uid.clone(),
+                language: language.clone(),
+                sample_rate: *sample_rate,
+                request_timeout_seconds: *request_timeout_seconds,
+                enabled: true,
+            }
+            .validate()
+            .map_err(anyhow::Error::msg),
         }
     }
 }
@@ -229,6 +272,312 @@ pub enum GatewayProviderKind {
     LocalHttpAsr,
     VolcengineAsr,
     OpenAiCompatibleLlm,
+    ByteDanceTts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderFieldDescriptor {
+    pub name: String,
+    pub label: String,
+    pub input: String,
+    pub default_value: Option<String>,
+    pub required: bool,
+    pub secret: bool,
+    pub min: Option<String>,
+    pub max: Option<String>,
+    pub step: Option<String>,
+    pub options: Vec<ProviderFieldOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderFieldOption {
+    pub value: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderTypeDescriptor {
+    pub kind: GatewayProviderKind,
+    pub capability: String,
+    pub display_name: String,
+    pub fields: Vec<ProviderFieldDescriptor>,
+}
+
+impl GatewayProviderKind {
+    /// Compile-time provider plugin registry. Each adapter owns its parameter
+    /// schema; the Web UI consumes this metadata instead of hardcoding fields.
+    pub fn descriptors() -> Vec<ProviderTypeDescriptor> {
+        vec![
+            ProviderTypeDescriptor {
+                kind: Self::LocalHttpAsr,
+                capability: "asr".to_string(),
+                display_name: "provider.kind.localHttpAsr".to_string(),
+                fields: vec![
+                    field(
+                        "base_url",
+                        "form.baseUrl",
+                        "url",
+                        Some("http://127.0.0.1:8000"),
+                        true,
+                        false,
+                        None,
+                        None,
+                        None,
+                    ),
+                    field(
+                        "language",
+                        "form.language",
+                        "text",
+                        Some("zh-CN"),
+                        true,
+                        false,
+                        None,
+                        None,
+                        None,
+                    ),
+                    field(
+                        "request_timeout_seconds",
+                        "form.timeout",
+                        "number",
+                        Some("60"),
+                        true,
+                        false,
+                        Some("1"),
+                        Some("600"),
+                        Some("1"),
+                    ),
+                ],
+            },
+            ProviderTypeDescriptor {
+                kind: Self::OpenAiCompatibleLlm,
+                capability: "llm".to_string(),
+                display_name: "provider.kind.openAiCompatibleLlm".to_string(),
+                fields: vec![
+                    field(
+                        "base_url",
+                        "form.baseUrl",
+                        "url",
+                        None,
+                        true,
+                        false,
+                        None,
+                        None,
+                        None,
+                    ),
+                    field(
+                        "model",
+                        "form.model",
+                        "text",
+                        None,
+                        true,
+                        false,
+                        None,
+                        None,
+                        None,
+                    ),
+                    ProviderFieldDescriptor {
+                        name: "structured_output_mode".to_string(),
+                        label: "form.outputMode".to_string(),
+                        input: "select".to_string(),
+                        default_value: Some("json_object".to_string()),
+                        required: true,
+                        secret: false,
+                        min: None,
+                        max: None,
+                        step: None,
+                        options: vec![
+                            option("json_schema", "provider.outputMode.jsonSchema"),
+                            option("json_object", "provider.outputMode.jsonObject"),
+                            option("prompt_only", "provider.outputMode.promptOnly"),
+                        ],
+                    },
+                    field(
+                        "request_timeout_seconds",
+                        "form.timeout",
+                        "number",
+                        Some("60"),
+                        true,
+                        false,
+                        Some("1"),
+                        Some("600"),
+                        Some("1"),
+                    ),
+                    field(
+                        "max_output_tokens",
+                        "form.maxTokens",
+                        "number",
+                        Some("2048"),
+                        true,
+                        false,
+                        Some("1"),
+                        Some("65536"),
+                        Some("1"),
+                    ),
+                    field(
+                        "temperature",
+                        "form.temperature",
+                        "number",
+                        Some("0.2"),
+                        true,
+                        false,
+                        Some("0"),
+                        Some("2"),
+                        Some("0.1"),
+                    ),
+                    field(
+                        "secret",
+                        "form.apiKey",
+                        "password",
+                        None,
+                        false,
+                        true,
+                        None,
+                        None,
+                        None,
+                    ),
+                ],
+            },
+            ProviderTypeDescriptor {
+                kind: Self::ByteDanceTts,
+                capability: "tts".to_string(),
+                display_name: "provider.kind.byteDanceTts".to_string(),
+                fields: vec![
+                    field(
+                        "endpoint",
+                        "form.endpoint",
+                        "url",
+                        Some("https://openspeech.bytedance.com/api/v1/tts"),
+                        true,
+                        false,
+                        None,
+                        None,
+                        None,
+                    ),
+                    field(
+                        "app_id",
+                        "form.appId",
+                        "text",
+                        None,
+                        true,
+                        false,
+                        None,
+                        None,
+                        None,
+                    ),
+                    field(
+                        "cluster",
+                        "form.cluster",
+                        "text",
+                        Some("volcano_tts"),
+                        true,
+                        false,
+                        None,
+                        None,
+                        None,
+                    ),
+                    field(
+                        "voice_type",
+                        "form.voiceType",
+                        "text",
+                        Some("BV001_streaming"),
+                        true,
+                        false,
+                        None,
+                        None,
+                        None,
+                    ),
+                    field(
+                        "uid",
+                        "form.uid",
+                        "text",
+                        Some("voipswitch"),
+                        true,
+                        false,
+                        None,
+                        None,
+                        None,
+                    ),
+                    field(
+                        "language",
+                        "form.language",
+                        "text",
+                        Some("zh"),
+                        true,
+                        false,
+                        None,
+                        None,
+                        None,
+                    ),
+                    field(
+                        "sample_rate",
+                        "form.sampleRate",
+                        "number",
+                        Some("16000"),
+                        true,
+                        false,
+                        Some("8000"),
+                        Some("16000"),
+                        Some("8000"),
+                    ),
+                    field(
+                        "request_timeout_seconds",
+                        "form.timeout",
+                        "number",
+                        Some("60"),
+                        true,
+                        false,
+                        Some("1"),
+                        Some("600"),
+                        Some("1"),
+                    ),
+                    field(
+                        "secret",
+                        "form.accessToken",
+                        "password",
+                        None,
+                        false,
+                        true,
+                        None,
+                        None,
+                        None,
+                    ),
+                ],
+            },
+        ]
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn field(
+    name: &str,
+    label: &str,
+    input: &str,
+    default_value: Option<&str>,
+    required: bool,
+    secret: bool,
+    min: Option<&str>,
+    max: Option<&str>,
+    step: Option<&str>,
+) -> ProviderFieldDescriptor {
+    ProviderFieldDescriptor {
+        name: name.to_string(),
+        label: label.to_string(),
+        input: input.to_string(),
+        default_value: default_value.map(str::to_string),
+        required,
+        secret,
+        min: min.map(str::to_string),
+        max: max.map(str::to_string),
+        step: step.map(str::to_string),
+        options: Vec::new(),
+    }
+}
+
+fn option(value: &str, label: &str) -> ProviderFieldOption {
+    ProviderFieldOption {
+        value: value.to_string(),
+        label: label.to_string(),
+    }
 }
 
 impl GatewayProviderKind {
@@ -237,6 +586,7 @@ impl GatewayProviderKind {
             Self::LocalHttpAsr => "asr",
             Self::VolcengineAsr => "asr",
             Self::OpenAiCompatibleLlm => "llm",
+            Self::ByteDanceTts => "tts",
         }
     }
 }
@@ -274,12 +624,12 @@ impl GatewayProviderConfig {
 impl Default for GatewayProviderConfig {
     fn default() -> Self {
         Self {
-            provider_id: "volcengine-asr".to_string(),
-            display_name: "Volcengine ASR".to_string(),
-            kind: GatewayProviderKind::VolcengineAsr,
+            provider_id: "local-asr".to_string(),
+            display_name: "Local HTTP ASR".to_string(),
+            kind: GatewayProviderKind::LocalHttpAsr,
             enabled: false,
             revision: 1,
-            parameters: GatewayProviderParameters::defaults_for(GatewayProviderKind::VolcengineAsr),
+            parameters: GatewayProviderParameters::defaults_for(GatewayProviderKind::LocalHttpAsr),
             secret: ProviderSecretStatus::default(),
             runtime_state: ProviderRuntimeState::Incomplete,
             runtime_message: None,
@@ -301,6 +651,11 @@ pub struct ProviderUpsertRequest {
 
 impl ProviderUpsertRequest {
     pub fn validate(&self) -> Result<()> {
+        if self.kind == GatewayProviderKind::VolcengineAsr {
+            bail!(
+                "Volcengine ASR is not available in this release; configure a local ASR provider"
+            );
+        }
         let candidate = GatewayProviderConfig {
             provider_id: self.provider_id.clone(),
             display_name: self.display_name.clone(),
@@ -367,7 +722,7 @@ impl Default for GatewayProfileConfig {
             profile_version: 1,
             enabled: true,
             pipeline_type: AiPipelineType::PostCallAnalysis,
-            asr_provider_id: Some("volcengine-asr".to_string()),
+            asr_provider_id: Some("local-asr".to_string()),
             llm_provider_id: Some("openai-llm".to_string()),
             tts_provider_id: None,
             capture: CaptureThresholds::default(),
@@ -518,5 +873,19 @@ mod tests {
         assert_eq!(config.execution.post_call_job_deadline_seconds, 14_400);
         assert_eq!(config.storage.temporary_audio_retention_hours, 72);
         assert_eq!(config.capture_defaults.complete_ratio_ppm, 995_000);
+    }
+
+    #[test]
+    fn rejects_legacy_volcengine_provider_requests() {
+        let request = ProviderUpsertRequest {
+            provider_id: "legacy-volcengine".to_string(),
+            display_name: "Legacy ASR".to_string(),
+            kind: GatewayProviderKind::VolcengineAsr,
+            enabled: false,
+            expected_revision: None,
+            parameters: GatewayProviderParameters::defaults_for(GatewayProviderKind::VolcengineAsr),
+            secret: None,
+        };
+        assert!(request.validate().is_err());
     }
 }

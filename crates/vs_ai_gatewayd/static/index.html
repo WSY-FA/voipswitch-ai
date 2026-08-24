@@ -27,7 +27,9 @@
       <div class="brand"><span class="brand-mark">AI</span><span data-i18n="brand.gateway"></span></div>
       <nav aria-label="AI Gateway" data-i18n="nav.ariaLabel" data-i18n-attr="aria-label">
         <a href="#overview" class="nav-link active" data-i18n="nav.overview"></a>
-        <a href="#providers" class="nav-link" data-i18n="nav.providers"></a>
+        <a href="#asr-providers" class="nav-link" data-i18n="nav.asrProviders"></a>
+        <a href="#llm-providers" class="nav-link" data-i18n="nav.llmProviders"></a>
+        <a href="#tts-providers" class="nav-link" data-i18n="nav.ttsProviders"></a>
         <a href="#profiles" class="nav-link" data-i18n="nav.profiles"></a>
       </nav>
       <div class="sidebar-foot"><span id="currentUser"></span><button id="logout" class="text-button" type="button" data-i18n="nav.logout"></button></div>
@@ -52,10 +54,24 @@
         </section>
       </section>
 
-      <section class="view" id="providers" hidden>
+      <section class="view" id="asr-providers" hidden>
         <section class="section-block">
-          <div class="section-heading"><div><p class="eyebrow" data-i18n="brand.executionBackends"></p><h3 data-i18n="nav.providers"></h3></div><button class="primary add-button" id="addProviderButton" type="button" data-i18n="provider.add"></button></div>
-          <div class="table-wrap"><table><thead><tr><th data-i18n="table.provider"></th><th data-i18n="table.type"></th><th data-i18n="table.capability"></th><th data-i18n="table.secret"></th><th data-i18n="table.status"></th><th data-i18n="table.actions"></th></tr></thead><tbody id="providerRows"></tbody></table></div>
+          <div class="section-heading"><div><p class="eyebrow" data-i18n="brand.executionBackends"></p><h3 data-i18n="nav.asrProviders"></h3></div><button class="primary add-button" id="addAsrProviderButton" type="button" data-provider-capability="asr" data-i18n="provider.add"></button></div>
+          <div class="table-wrap"><table><thead><tr><th data-i18n="table.provider"></th><th data-i18n="table.type"></th><th data-i18n="table.secret"></th><th data-i18n="table.status"></th><th data-i18n="table.actions"></th></tr></thead><tbody id="asrProviderRows"></tbody></table></div>
+        </section>
+      </section>
+
+      <section class="view" id="llm-providers" hidden>
+        <section class="section-block">
+          <div class="section-heading"><div><p class="eyebrow" data-i18n="brand.executionBackends"></p><h3 data-i18n="nav.llmProviders"></h3></div><button class="primary add-button" id="addLlmProviderButton" type="button" data-provider-capability="llm" data-i18n="provider.add"></button></div>
+          <div class="table-wrap"><table><thead><tr><th data-i18n="table.provider"></th><th data-i18n="table.type"></th><th data-i18n="table.secret"></th><th data-i18n="table.status"></th><th data-i18n="table.actions"></th></tr></thead><tbody id="llmProviderRows"></tbody></table></div>
+        </section>
+      </section>
+
+      <section class="view" id="tts-providers" hidden>
+        <section class="section-block">
+          <div class="section-heading"><div><p class="eyebrow" data-i18n="brand.executionBackends"></p><h3 data-i18n="nav.ttsProviders"></h3></div><button class="primary add-button" id="addTtsProviderButton" type="button" data-provider-capability="tts" data-i18n="provider.add"></button></div>
+          <div class="table-wrap"><table><thead><tr><th data-i18n="table.provider"></th><th data-i18n="table.type"></th><th data-i18n="table.secret"></th><th data-i18n="table.status"></th><th data-i18n="table.actions"></th></tr></thead><tbody id="ttsProviderRows"></tbody></table></div>
         </section>
       </section>
 
@@ -70,7 +86,7 @@
   <dialog class="modal" id="providerDialog">
     <form class="modal__surface modal__surface--wide" id="providerForm">
       <header class="modal__header"><div><p class="eyebrow" data-i18n="brand.executionBackends"></p><h2 id="providerDialogTitle" data-i18n="provider.add"></h2></div><button class="icon-button" type="button" data-close-dialog="providerDialog" data-i18n="actions.close" data-i18n-attr="aria-label">×</button></header>
-      <div class="modal__body"><input name="expected_revision" type="hidden"><div class="config-form provider-form"><label><span data-i18n="form.providerId"></span><input name="provider_id" required pattern="[A-Za-z0-9._:-]+"></label><label><span data-i18n="form.displayName"></span><input name="display_name" required maxlength="128"></label><label><span data-i18n="form.type"></span><select name="kind" id="providerKind"><option value="volcengine_asr" data-i18n="provider.kind.volcengineAsr"></option><option value="open_ai_compatible_llm" data-i18n="provider.kind.openAiCompatibleLlm"></option></select></label><fieldset class="provider-fields" id="volcengineFields" hidden><legend data-i18n="provider.volcengineFields"></legend><label><span data-i18n="form.apiVariant"></span><select name="api_variant"><option value="big_model_streaming" data-i18n="provider.apiVariant.bigModelStreaming"></option></select></label><label><span data-i18n="form.endpointOverride"></span><input name="endpoint_override" type="url" placeholder="wss://"></label><label><span data-i18n="form.appId"></span><input name="app_id"></label><label><span data-i18n="form.resourceId"></span><input name="resource_id"></label><label><span data-i18n="form.modelCluster"></span><input name="model_or_cluster"></label><label><span data-i18n="form.language"></span><input name="language" value="zh-CN"></label><label><span data-i18n="form.timeout"></span><input name="request_timeout_seconds" type="number" min="1" max="600" value="30"></label><label><span data-i18n="form.maxConcurrency"></span><input name="max_concurrent_sessions" type="number" min="1" value="10"></label><label><span data-i18n="form.maxSession"></span><input name="max_session_seconds" type="number" min="60" value="14400"></label><label class="secret-field"><span data-i18n="form.accessToken"></span><input name="secret" type="password" autocomplete="new-password"><small id="providerSecretHint"></small></label></fieldset><fieldset class="provider-fields" id="openAiFields" hidden><legend data-i18n="provider.openaiFields"></legend><label><span data-i18n="form.baseUrl"></span><input name="base_url" type="url" placeholder="https://provider.example/v1"></label><label><span data-i18n="form.model"></span><input name="model"></label><label><span data-i18n="form.outputMode"></span><select name="structured_output_mode"><option value="json_schema" data-i18n="provider.outputMode.jsonSchema"></option><option value="json_object" data-i18n="provider.outputMode.jsonObject"></option><option value="prompt_only" data-i18n="provider.outputMode.promptOnly"></option></select></label><label><span data-i18n="form.timeout"></span><input name="request_timeout_seconds" type="number" min="1" max="600" value="60"></label><label><span data-i18n="form.maxTokens"></span><input name="max_output_tokens" type="number" min="1" max="65536" value="2048"></label><label><span data-i18n="form.temperature"></span><input name="temperature" type="number" min="0" max="2" step="0.1" value="0.2"></label><label class="secret-field"><span data-i18n="form.apiKey"></span><input name="secret" type="password" autocomplete="new-password"><small id="providerSecretHintOpenAi"></small></label></fieldset><label class="check"><input name="enabled" type="checkbox" checked><span data-i18n="form.enabled"></span></label></div><p class="message" id="providerMessage" role="status"></p></div>
+      <div class="modal__body"><input name="expected_revision" type="hidden"><div class="config-form provider-form"><label><span data-i18n="form.providerType"></span><select name="kind" id="providerKind" required></select></label><label><span data-i18n="form.providerId"></span><input name="provider_id" required pattern="[A-Za-z0-9._:-]+"></label><label><span data-i18n="form.displayName"></span><input name="display_name" required maxlength="128"></label><div id="providerFields"></div><label class="check"><input name="enabled" type="checkbox" checked><span data-i18n="form.enabled"></span></label></div><p class="message" id="providerMessage" role="status"></p></div>
       <footer class="modal__footer"><button class="secondary" type="button" data-close-dialog="providerDialog" data-i18n="common.cancel"></button><button class="primary" type="submit" data-i18n="provider.save"></button></footer>
     </form>
   </dialog>

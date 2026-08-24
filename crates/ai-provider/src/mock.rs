@@ -1,5 +1,6 @@
 use crate::{
     AsrOutput, AsrProvider, AsrRequest, LlmOutput, LlmProvider, LlmRequest, ProviderResult,
+    TtsOutput, TtsProvider, TtsRequest,
 };
 use ai_protocol::control::{StructuredCallResult, TranscriptSegment};
 use ai_protocol::id::ProviderId;
@@ -48,6 +49,31 @@ pub struct MockLlmProvider {
     provider_id: ProviderId,
 }
 
+pub struct MockTtsProvider {
+    provider_id: ProviderId,
+}
+
+impl MockTtsProvider {
+    pub fn new(provider_id: ProviderId) -> Self {
+        Self { provider_id }
+    }
+}
+
+#[async_trait]
+impl TtsProvider for MockTtsProvider {
+    fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    async fn synthesize(&self, request: TtsRequest) -> ProviderResult<TtsOutput> {
+        let samples = request.text.chars().count().max(1) * 320;
+        Ok(TtsOutput {
+            pcm16_le: vec![0; samples * 2],
+            sample_rate: 16_000,
+        })
+    }
+}
+
 impl MockLlmProvider {
     pub fn new(provider_id: ProviderId) -> Self {
         Self { provider_id }
@@ -71,6 +97,7 @@ impl LlmProvider for MockLlmProvider {
                 key_points: vec!["mock-key-point".to_string()],
                 action_items: Vec::new(),
                 tags: vec!["mock".to_string()],
+                action: None,
             },
             input_tokens: None,
             output_tokens: None,

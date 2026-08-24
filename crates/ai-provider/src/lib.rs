@@ -4,11 +4,13 @@ mod mock;
 mod registry;
 
 pub use config::{
-    LocalHttpAsrConfig, LocalHttpTtsConfig, OpenAiCompatibleLlmConfig, StructuredOutputMode,
-    VolcengineApiVariant, VolcengineAsrConfig,
+    ByteDanceTtsConfig, LocalHttpAsrConfig, LocalHttpTtsConfig, OpenAiCompatibleLlmConfig,
+    StructuredOutputMode, VolcengineApiVariant, VolcengineAsrConfig,
 };
-pub use http::{LocalHttpAsrProvider, LocalHttpTtsProvider, OpenAiCompatibleLlmProvider};
-pub use mock::{MockAsrProvider, MockLlmProvider};
+pub use http::{
+    ByteDanceTtsProvider, LocalHttpAsrProvider, LocalHttpTtsProvider, OpenAiCompatibleLlmProvider,
+};
+pub use mock::{MockAsrProvider, MockLlmProvider, MockTtsProvider};
 pub use registry::ProviderRegistry;
 
 use ai_protocol::control::{StructuredCallResult, TranscriptSegment};
@@ -83,6 +85,7 @@ pub struct AsrOutput {
 pub struct LlmRequest {
     pub operation_id: String,
     pub transcript: Vec<TranscriptSegment>,
+    pub allow_actions: bool,
 }
 
 #[derive(Debug, Clone)]

@@ -164,11 +164,61 @@ impl ControlMessage {
             Self::SubmitPostCallJob(request) => request.validate(),
             Self::ProfileCatalogSnapshot(snapshot) => snapshot.validate(),
             Self::StartConversation(request) => request.validate(),
+            Self::ActionRequested(request) => request.validate(),
             Self::EndAudioInput(request) if request.final_sequences.is_empty() => {
                 bail!("end_audio_input requires at least one final sequence")
             }
             _ => Ok(()),
         }
+    }
+}
+
+impl ActionRequested {
+    pub fn validate(&self) -> Result<()> {
+        if self.conversation.generation == 0 || self.generation == 0 {
+            bail!("action generation must be greater than zero");
+        }
+        if self.operation_id.as_str().trim().is_empty() {
+            bail!("action operation id must not be empty");
+        }
+        if self.deadline_at_ms == 0 {
+            bail!("action deadline must be set");
+        }
+        match &self.action {
+            AgentAction::PlayText { text, voice } => {
+                if text.trim().is_empty() || text.len() > 16 * 1024 || voice.len() > 256 {
+                    bail!("invalid PlayText parameters");
+                }
+            }
+            AgentAction::CollectDigits {
+                max_digits,
+                timeout_ms,
+            } => {
+                if *max_digits == 0 || *max_digits > 32 || *timeout_ms == 0 || *timeout_ms > 300_000
+                {
+                    bail!("invalid CollectDigits parameters");
+                }
+            }
+            AgentAction::TransferToExtension { number } => {
+                if number.is_empty()
+                    || number.len() > 32
+                    || !number.bytes().all(|b| b.is_ascii_digit())
+                {
+                    bail!("invalid extension number");
+                }
+            }
+            AgentAction::TransferToBusinessTarget { target } => {
+                if target.is_empty() || target.len() > 256 || target.contains(['\n', '\r']) {
+                    bail!("invalid business target");
+                }
+            }
+            AgentAction::EndCall { reason } => {
+                if reason.len() > 1024 {
+                    bail!("end-call reason is too long");
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -440,6 +490,8 @@ pub struct StructuredCallResult {
     pub key_points: Vec<String>,
     pub action_items: Vec<String>,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub action: Option<AgentAction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -599,5 +651,36 @@ mod tests {
             envelope.message,
             ControlMessage::ConnectorHello(_)
         ));
+    }
+
+    #[test]
+    fn validates_voice_agent_action_allowlist_parameters() {
+        let conversation = JobRef {
+            job_id: id("job-1"),
+            tenant_id: id("tenant-1"),
+            conversation_id: id("conversation-1"),
+            operation_id: id("voice-agent-v1"),
+            generation: 1,
+        };
+        let request = ActionRequested {
+            conversation: conversation.clone(),
+            operation_id: id("voice-agent-v1:action:1"),
+            generation: 1,
+            action: AgentAction::EndCall {
+                reason: "user requested".to_string(),
+            },
+            deadline_at_ms: 10,
+        };
+        assert!(request.validate().is_ok());
+        assert!(
+            ActionRequested {
+                action: AgentAction::TransferToExtension {
+                    number: "12x".to_string(),
+                },
+                ..request
+            }
+            .validate()
+            .is_err()
+        );
     }
 }

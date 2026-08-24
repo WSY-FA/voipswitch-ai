@@ -1,4 +1,4 @@
-use crate::config::{LocalHttpAsrConfig, LocalHttpTtsConfig};
+use crate::config::{ByteDanceTtsConfig, LocalHttpAsrConfig, LocalHttpTtsConfig};
 use crate::{
     AsrAudioInput, AsrOutput, AsrProvider, AsrRequest, LlmOutput, LlmProvider, LlmRequest,
     OpenAiCompatibleLlmConfig, ProviderError, ProviderErrorKind, ProviderId, ProviderResult,
@@ -53,10 +53,15 @@ impl LlmProvider for OpenAiCompatibleLlmProvider {
             json!({"participant_id": segment.participant_id.as_str(), "start_ms": segment.start_ms,
                    "end_ms": segment.end_ms, "text": segment.text})
         }).collect::<Vec<_>>();
+        let action_instruction = if request.allow_actions {
+            " Include an optional action object using only play_text, collect_digits, transfer_to_extension, transfer_to_business_target, or end_call; use null when no action is needed."
+        } else {
+            " Set action to null."
+        };
         let mut body = json!({
             "model": self.config.model,
             "messages": [
-                {"role": "system", "content": "Return only a JSON object with keys schema_version, summary, purpose, outcome, key_points, action_items, tags. Set schema_version to 1. Values must match the requested call-analysis schema."},
+                {"role": "system", "content": format!("只返回一个 JSON 对象，字段必须为 schema_version、summary、purpose、outcome、key_points、action_items、tags、action。schema_version 必须为 1。除字段名和 action 结构中的固定枚举值外，summary、purpose、outcome、key_points、action_items、tags 的内容全部使用简体中文；参与方只能称为“主叫”或“被叫”，不要使用 caller、callee 或其他英文称呼；不要输出英文翻译，不要添加 Markdown 或其他文字。根据按时间排序的参与方转写内容分析整通电话，不要遗漏任一参与方。{action_instruction}")},
                 {"role": "user", "content": serde_json::to_string(&transcript).map_err(|error| invalid_response(error.to_string()))?}
             ],
             "max_tokens": self.config.max_output_tokens,
@@ -93,8 +98,7 @@ impl LlmProvider for OpenAiCompatibleLlmProvider {
             .and_then(|message| message.get("content"))
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_response("missing assistant content".to_string()))?;
-        let result: StructuredCallResult = serde_json::from_str(content)
-            .map_err(|error| invalid_response(format!("structured result JSON: {error}")))?;
+        let result = parse_structured_call_result(content)?;
         Ok(LlmOutput {
             request_id,
             result,
@@ -108,6 +112,56 @@ impl LlmProvider for OpenAiCompatibleLlmProvider {
     }
 }
 
+fn parse_structured_call_result(content: &str) -> ProviderResult<StructuredCallResult> {
+    if let Ok(result) = serde_json::from_str::<StructuredCallResult>(content) {
+        return Ok(result);
+    }
+    let value: Value = serde_json::from_str(content)
+        .map_err(|error| invalid_response(format!("structured result JSON: {error}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid_response("structured result must be a JSON object".to_string()))?;
+    let strings = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|items| items.iter().map(json_value_as_string).collect())
+            .unwrap_or_default()
+    };
+    Ok(StructuredCallResult {
+        schema_version: object
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            .unwrap_or(1) as u32,
+        summary: object
+            .get("summary")
+            .map(json_value_as_string)
+            .unwrap_or_default(),
+        purpose: object
+            .get("purpose")
+            .map(json_value_as_string)
+            .unwrap_or_default(),
+        outcome: object
+            .get("outcome")
+            .map(json_value_as_string)
+            .unwrap_or_default(),
+        key_points: strings("key_points"),
+        action_items: strings("action_items"),
+        tags: strings("tags"),
+        action: object
+            .get("action")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
+    })
+}
+
+fn json_value_as_string(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default())
+}
+
 pub struct LocalHttpAsrProvider {
     provider_id: ProviderId,
     config: LocalHttpAsrConfig,
@@ -118,6 +172,121 @@ pub struct LocalHttpTtsProvider {
     provider_id: ProviderId,
     config: LocalHttpTtsConfig,
     client: reqwest::Client,
+}
+
+pub struct ByteDanceTtsProvider {
+    provider_id: ProviderId,
+    config: ByteDanceTtsConfig,
+    token: String,
+    client: reqwest::Client,
+}
+
+impl ByteDanceTtsProvider {
+    pub fn new(
+        provider_id: ProviderId,
+        config: ByteDanceTtsConfig,
+        token: String,
+    ) -> ProviderResult<Self> {
+        config.validate().map_err(invalid_config)?;
+        if token.trim().is_empty() {
+            return Err(invalid_config("ByteDance access token is required"));
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.request_timeout_seconds))
+            .build()
+            .map_err(|error| transport_error(format!("build HTTP client: {error}")))?;
+        Ok(Self {
+            provider_id,
+            config,
+            token,
+            client,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ByteDanceTtsResponse {
+    data: Option<String>,
+    code: Option<i64>,
+    message: Option<String>,
+}
+
+#[async_trait]
+impl TtsProvider for ByteDanceTtsProvider {
+    fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    async fn synthesize(&self, request: TtsRequest) -> ProviderResult<TtsOutput> {
+        if request.text.trim().is_empty() {
+            return Err(invalid_request("TTS text is empty"));
+        }
+        let body = json!({
+            "app": {
+                "appid": self.config.app_id,
+                "token": self.token,
+                "cluster": self.config.cluster,
+            },
+            "user": {"uid": self.config.uid},
+            "audio": {
+                "voice_type": if request.voice.trim().is_empty() { &self.config.voice_type } else { &request.voice },
+                "encoding": "pcm",
+                "rate": self.config.sample_rate,
+                "speed_ratio": 1.0,
+                "volume_ratio": 1.0,
+                "pitch_ratio": 1.0,
+                "language": self.config.language,
+            },
+            "request": {
+                "reqid": request.operation_id,
+                "text": request.text,
+                "text_type": "plain",
+                "operation": "query",
+                "with_frontend": "1",
+                "frontend_type": "unitTson",
+                "pure_english_opt": "1",
+            },
+        });
+        let response = self
+            .client
+            .post(&self.config.endpoint)
+            .header("Authorization", format!("Bearer;{}", self.token))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| transport_error(error.to_string()))?;
+        let status = response.status();
+        let payload: ByteDanceTtsResponse = response
+            .json()
+            .await
+            .map_err(|error| invalid_response(error.to_string()))?;
+        let Some(audio_base64) = payload.data else {
+            if status.as_u16() == 401 || payload.code == Some(3001) {
+                return Err(ProviderError {
+                    kind: ProviderErrorKind::Authentication,
+                    code: "tts_authentication_failed",
+                    message: "ByteDance TTS authentication failed".to_string(),
+                    retry_after_ms: None,
+                });
+            }
+            return Err(http_status(
+                status.as_u16(),
+                &json!({"code": payload.code, "message": payload.message}),
+            ));
+        };
+        let pcm16_le = base64::engine::general_purpose::STANDARD
+            .decode(audio_base64)
+            .map_err(|error| invalid_response(format!("invalid ByteDance TTS audio: {error}")))?;
+        if pcm16_le.is_empty() || pcm16_le.len() % 2 != 0 {
+            return Err(invalid_response(
+                "ByteDance TTS audio must be non-empty PCM16LE",
+            ));
+        }
+        Ok(TtsOutput {
+            pcm16_le,
+            sample_rate: self.config.sample_rate,
+        })
+    }
 }
 
 impl LocalHttpTtsProvider {
@@ -216,74 +385,90 @@ impl AsrProvider for LocalHttpAsrProvider {
     }
 
     async fn transcribe(&self, request: AsrRequest) -> ProviderResult<AsrOutput> {
-        let first = request
-            .streams
-            .first()
-            .ok_or_else(|| invalid_request("ASR request has no streams"))?;
-        let wav = pcm_wav(first);
-        let form = Form::new().part(
-            "file",
-            Part::bytes(wav)
-                .file_name("capture.wav")
-                .mime_str("audio/wav")
-                .map_err(|error| invalid_config(error.to_string()))?,
-        );
-        let response = self
-            .client
-            .post(format!(
-                "{}/asr",
-                self.config.base_url.trim_end_matches('/')
-            ))
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|error| transport_error(error.to_string()))?;
-        let status = response.status();
-        let payload: LocalAsrResponse = response
-            .json()
-            .await
-            .map_err(|error| invalid_response(error.to_string()))?;
-        if !status.is_success() {
-            return Err(http_status(status.as_u16(), &json!({"text": payload.text})));
+        if request.streams.is_empty() {
+            return Err(invalid_request("ASR request has no streams"));
         }
-        let text = payload.text.unwrap_or_default();
-        let segments = payload
-            .result
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|segment| {
-                let text = segment.text.filter(|value| !value.trim().is_empty())?;
-                let (start_ms, end_ms) = segment
-                    .timestamp
-                    .as_ref()
-                    .and_then(|times| times.first())
-                    .map(|range| {
-                        (
-                            range.first().copied().unwrap_or(0),
-                            range.get(1).copied().unwrap_or(first.duration_ms),
-                        )
+
+        // The local endpoint accepts one WAV per request. Send every captured
+        // participant stream independently, then merge the relative timestamps
+        // into one chronological transcript for the call.
+        let mut segments = Vec::new();
+        for stream in &request.streams {
+            let wav = pcm_wav(stream);
+            let form = Form::new().part(
+                "file",
+                Part::bytes(wav)
+                    .file_name("capture.wav")
+                    .mime_str("audio/wav")
+                    .map_err(|error| invalid_config(error.to_string()))?,
+            );
+            let response = self
+                .client
+                .post(format!(
+                    "{}/asr",
+                    self.config.base_url.trim_end_matches('/')
+                ))
+                .multipart(form)
+                .send()
+                .await
+                .map_err(|error| transport_error(error.to_string()))?;
+            let status = response.status();
+            let payload: LocalAsrResponse = response
+                .json()
+                .await
+                .map_err(|error| invalid_response(error.to_string()))?;
+            if !status.is_success() {
+                return Err(http_status(status.as_u16(), &json!({"text": payload.text})));
+            }
+            let text = payload.text.unwrap_or_default();
+            let stream_segments = payload
+                .result
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|segment| {
+                    let text = segment.text.filter(|value| !value.trim().is_empty())?;
+                    let (start_ms, end_ms) = segment
+                        .timestamp
+                        .as_ref()
+                        .and_then(|times| times.first())
+                        .map(|range| {
+                            (
+                                range.first().copied().unwrap_or(0),
+                                range.get(1).copied().unwrap_or(stream.duration_ms),
+                            )
+                        })
+                        .unwrap_or((0, stream.duration_ms));
+                    Some(TranscriptSegment {
+                        participant_id: stream.participant_id.clone(),
+                        start_ms,
+                        end_ms,
+                        text,
+                        final_segment: true,
                     })
-                    .unwrap_or((0, first.duration_ms));
-                Some(TranscriptSegment {
-                    participant_id: first.participant_id.clone(),
-                    start_ms,
-                    end_ms,
+                })
+                .collect::<Vec<_>>();
+            if stream_segments.is_empty() && !text.trim().is_empty() {
+                segments.push(TranscriptSegment {
+                    participant_id: stream.participant_id.clone(),
+                    start_ms: 0,
+                    end_ms: stream.duration_ms,
                     text,
                     final_segment: true,
+                });
+            } else {
+                segments.extend(stream_segments);
+            }
+        }
+        segments.sort_by(|left, right| {
+            left.start_ms
+                .cmp(&right.start_ms)
+                .then_with(|| left.end_ms.cmp(&right.end_ms))
+                .then_with(|| {
+                    left.participant_id
+                        .as_str()
+                        .cmp(right.participant_id.as_str())
                 })
-            })
-            .collect::<Vec<_>>();
-        let segments = if segments.is_empty() && !text.trim().is_empty() {
-            vec![TranscriptSegment {
-                participant_id: first.participant_id.clone(),
-                start_ms: 0,
-                end_ms: first.duration_ms,
-                text,
-                final_segment: true,
-            }]
-        } else {
-            segments
-        };
+        });
         Ok(AsrOutput {
             request_id: Some(format!("local-asr:{}", request.operation_id)),
             segments,

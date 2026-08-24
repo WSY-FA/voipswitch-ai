@@ -2,6 +2,7 @@ const $ = (selector) => document.querySelector(selector);
 const LANGUAGE_KEY = "vs_ai_gateway_language";
 const LANGUAGE_FILES = ["zh-CN", "en-US"];
 let catalog = null;
+let providerTypes = [];
 let locale = "zh-CN";
 let messages = {};
 
@@ -67,8 +68,10 @@ async function api(path, options = {}) {
 
 function capability(kind) { return kind.includes("asr") ? "ASR" : kind.includes("tts") ? "TTS" : "LLM"; }
 function capabilityLabel(kind) { return t(`provider.capability.${capability(kind).toLowerCase()}`); }
+function providerType(kind) { return providerTypes.find((item) => item.kind === kind); }
 function providerKindLabel(kind) {
-  return t(`provider.kind.${({ volcengine_asr: "volcengineAsr", open_ai_compatible_llm: "openAiCompatibleLlm" })[kind] || kind}`);
+  const descriptor = providerType(kind);
+  return descriptor ? t(descriptor.display_name) : kind;
 }
 function providerById(id) { return catalog?.providers.find((item) => item.provider_id === id); }
 function providerReady(id, expected) {
@@ -126,10 +129,17 @@ function render(next) {
   $("#providerEnabled").textContent = `${enabled}/${catalog.providers.length}`;
   $("#profileExecutable").textContent = `${executable}/${catalog.profiles.length}`;
   $("#overviewProfiles").innerHTML = catalog.profiles.map((profile) => `<tr><td>${escapeHtml(profile.profile_id)}</td><td>${profile.profile_version}</td><td>${escapeHtml(t(`pipeline.${pipelineKey(profile.pipeline_type)}`))}</td><td>${escapeHtml(profile.asr_provider_id || "-")}</td><td>${profileStatus(profile)}</td></tr>`).join("") || `<tr><td colspan="5">${escapeHtml(t("empty.profiles"))}</td></tr>`;
-  $("#providerRows").innerHTML = catalog.providers.map((provider) => `<tr><td><strong>${escapeHtml(provider.display_name)}</strong><small>${escapeHtml(provider.provider_id)} · ${escapeHtml(t("provider.revision", { revision: provider.revision }))}</small></td><td>${escapeHtml(providerKindLabel(provider.kind))}</td><td>${escapeHtml(capabilityLabel(provider.kind))}</td><td>${provider.secret?.configured ? escapeHtml(provider.secret.masked || t("provider.secretConfigured")) : escapeHtml(t("provider.secretMissing"))}</td><td>${providerStatus(provider)}</td><td><div class="row-actions"><button class="table-action" type="button" data-edit-provider="${escapeHtml(provider.provider_id)}">${escapeHtml(t("common.edit"))}</button><button class="table-action table-action--danger" type="button" data-delete-provider="${escapeHtml(provider.provider_id)}">${escapeHtml(t("provider.delete"))}</button></div></td></tr>`).join("") || `<tr><td colspan="6">${escapeHtml(t("empty.providers"))}</td></tr>`;
+  renderProviderRows("asr", "#asrProviderRows");
+  renderProviderRows("llm", "#llmProviderRows");
+  renderProviderRows("tts", "#ttsProviderRows");
   $("#profileRows").innerHTML = catalog.profiles.map((profile) => `<tr><td>${escapeHtml(profile.profile_id)}</td><td>${profile.profile_version}</td><td>${escapeHtml(t(`pipeline.${pipelineKey(profile.pipeline_type)}`))}</td><td>${escapeHtml(profile.asr_provider_id || "-")}</td><td>${escapeHtml(profile.llm_provider_id || "-")}</td><td>${profileStatus(profile)}</td><td><div class="row-actions"><button class="table-action" type="button" data-edit-profile="${escapeHtml(profile.profile_id)}">${escapeHtml(t("common.edit"))}</button><button class="table-action table-action--danger" type="button" data-delete-profile="${escapeHtml(profile.profile_id)}">${escapeHtml(t("profile.delete"))}</button></div></td></tr>`).join("") || `<tr><td colspan="7">${escapeHtml(t("empty.profiles"))}</td></tr>`;
   fillProfileProviderOptions();
   setProfilePipelineFields();
+}
+
+function renderProviderRows(capabilityName, selector) {
+  const rows = catalog.providers.filter((provider) => capability(provider.kind).toLowerCase() === capabilityName);
+  $(selector).innerHTML = rows.map((provider) => `<tr><td><strong>${escapeHtml(provider.display_name)}</strong><small>${escapeHtml(provider.provider_id)} · ${escapeHtml(t("provider.revision", { revision: provider.revision }))}</small></td><td>${escapeHtml(providerKindLabel(provider.kind))}</td><td>${provider.secret?.configured ? escapeHtml(provider.secret.masked || t("provider.secretConfigured")) : escapeHtml(t("provider.secretMissing"))}</td><td>${providerStatus(provider)}</td><td><div class="row-actions"><button class="table-action" type="button" data-edit-provider="${escapeHtml(provider.provider_id)}">${escapeHtml(t("common.edit"))}</button><button class="table-action table-action--danger" type="button" data-delete-provider="${escapeHtml(provider.provider_id)}">${escapeHtml(t("provider.delete"))}</button></div></td></tr>`).join("") || `<tr><td colspan="5">${escapeHtml(t("empty.providers"))}</td></tr>`;
 }
 
 function pipelineKey(type) {
@@ -141,7 +151,8 @@ function updateGatewayStatus() {
 }
 
 async function loadCatalog() {
-  const result = await api("/api/catalog");
+  const [result, types] = await Promise.all([api("/api/catalog"), api("/api/provider-types")]);
+  providerTypes = types.provider_types || [];
   render(result.catalog);
   $("#statusDot").className = "status-dot online";
   updateGatewayStatus();
@@ -164,16 +175,59 @@ function closeDialog(id) {
 }
 
 function setProviderKindFields() {
-  const kind = $("#providerKind").value;
-  const panels = { volcengine_asr: $("#volcengineFields"), open_ai_compatible_llm: $("#openAiFields") };
-  Object.entries(panels).forEach(([value, panel]) => {
-    const active = kind === value;
-    panel.hidden = !active;
-    panel.querySelectorAll("input, select").forEach((input) => { input.disabled = !active; });
-  });
+  renderProviderFields($("#providerKind").value);
   const provider = providerById($("#providerForm [name=provider_id]").value);
-  document.querySelectorAll(".secret-field small").forEach((hint) => {
+  document.querySelectorAll(".provider-secret-hint").forEach((hint) => {
     hint.textContent = provider?.secret?.configured ? t("provider.secretRetain", { mask: provider.secret.masked || "" }) : t("provider.secretRequired");
+  });
+}
+
+function setProviderCapability(capabilityName) {
+  const select = $("#providerKind");
+  select.dataset.capability = capabilityName || "";
+  const types = providerTypes.filter((item) => !capabilityName || item.capability === capabilityName);
+  select.innerHTML = types.map((item) => `<option value="${escapeHtml(item.kind)}">${escapeHtml(t(item.display_name))}</option>`).join("");
+}
+
+function renderProviderFields(kind, values = {}, { maskedSecret = false } = {}) {
+  const container = $("#providerFields");
+  const descriptor = providerType(kind);
+  if (!descriptor) {
+    container.innerHTML = `<p class="form-hint">${escapeHtml(t("provider.typeUnavailable"))}</p>`;
+    return;
+  }
+  container.innerHTML = descriptor.fields.map((field) => {
+    const value = values[field.name] ?? field.default_value ?? "";
+    const attrs = [`name="${escapeHtml(field.name)}"`, "data-provider-field=true"];
+    if (field.required) attrs.push("required");
+    if (field.input === "url") attrs.push('type="url"');
+    else if (field.input === "number") attrs.push('type="number"');
+    else if (field.input === "password") {
+      const displayMaskedSecret = field.secret && maskedSecret && value;
+      attrs.push(`type="${displayMaskedSecret ? "text" : "password"}"`, `autocomplete="${displayMaskedSecret ? "off" : "new-password"}"`);
+      if (displayMaskedSecret) attrs.push('data-masked-secret="true"');
+      if (field.secret) attrs.push('data-provider-secret="true"');
+    }
+    if (field.min != null) attrs.push(`min="${escapeHtml(field.min)}"`);
+    if (field.max != null) attrs.push(`max="${escapeHtml(field.max)}"`);
+    if (field.step != null) attrs.push(`step="${escapeHtml(field.step)}"`);
+    if (field.input === "select") {
+      const options = field.options.map((option) => `<option value="${escapeHtml(option.value)}"${String(value) === option.value ? " selected" : ""}>${escapeHtml(t(option.label))}</option>`).join("");
+      return `<label><span>${escapeHtml(t(field.label))}</span><select ${attrs.join(" ")}>${options}</select></label>`;
+    }
+    const hint = field.secret ? '<small class="provider-secret-hint"></small>' : "";
+    return `<label${field.secret ? ' class="secret-field"' : ""}><span>${escapeHtml(t(field.label))}</span><input ${attrs.join(" ")} value="${escapeHtml(value)}">${hint}</label>`;
+  }).join("");
+  container.querySelectorAll('input[data-provider-secret="true"]').forEach((input) => {
+    input.addEventListener("focus", () => {
+      if (input.dataset.maskedSecret === "true") input.select();
+    });
+    input.addEventListener("input", () => {
+      if (input.dataset.maskedSecret !== "true") return;
+      input.dataset.maskedSecret = "false";
+      input.type = "password";
+      input.autocomplete = "new-password";
+    });
   });
 }
 
@@ -183,13 +237,21 @@ function resetProviderForm() {
   form.elements.expected_revision.value = "";
   form.elements.provider_id.readOnly = false;
   form.elements.kind.disabled = false;
-  $("#providerKind").value = "volcengine_asr";
+  setProviderCapability("");
+  $("#providerKind").value = providerTypes[0]?.kind || "";
   setProviderKindFields();
   message("#providerMessage", "");
 }
 
-function openNewProvider() {
+function openNewProvider(capabilityName = "asr") {
   resetProviderForm();
+  const kindByCapability = { asr: "local_http_asr", llm: "open_ai_compatible_llm", tts: "byte_dance_tts" };
+  setProviderCapability(capabilityName);
+  const preferred = kindByCapability[capabilityName];
+  $("#providerKind").value = providerTypes.some((item) => item.kind === preferred && item.capability === capabilityName)
+    ? preferred
+    : providerTypes.find((item) => item.capability === capabilityName)?.kind || "";
+  setProviderKindFields();
   $("#providerDialogTitle").textContent = t("provider.add");
   openDialog("#providerDialog");
 }
@@ -202,19 +264,15 @@ function editProvider(providerId) {
   form.elements.provider_id.value = provider.provider_id;
   form.elements.provider_id.readOnly = true;
   form.elements.display_name.value = provider.display_name;
+  setProviderCapability(capability(provider.kind).toLowerCase());
   form.elements.kind.value = provider.kind;
   form.elements.kind.disabled = true;
   form.elements.enabled.checked = provider.enabled;
   form.elements.expected_revision.value = provider.revision;
-  setProviderKindFields();
-  const parameters = provider.parameters || {};
-  Object.entries(parameters).forEach(([name, value]) => {
-    const input = form.querySelector(`[name="${name}"]`);
-    if (input && name !== "type") input.value = value ?? "";
-  });
-  document.querySelectorAll(".secret-field small").forEach((hint) => {
-    hint.textContent = provider.secret?.configured ? t("provider.secretRetain", { mask: provider.secret.masked || "" }) : t("provider.secretRequired");
-  });
+  const parameters = { ...(provider.parameters || {}) };
+  const secretField = providerType(provider.kind)?.fields.find((field) => field.secret);
+  if (secretField && provider.secret?.configured) parameters[secretField.name] = provider.secret.masked || "";
+  renderProviderFields(provider.kind, parameters, { maskedSecret: Boolean(provider.secret?.configured) });
   $("#providerDialogTitle").textContent = t("provider.edit");
   message("#providerMessage", "");
   openDialog("#providerDialog");
@@ -243,13 +301,17 @@ function providerPayload(form) {
     enabled: form.elements.enabled.checked,
     expected_revision: form.elements.expected_revision.value ? Number(form.elements.expected_revision.value) : null,
   };
-  const panel = kind === "volcengine_asr" ? $("#volcengineFields") : $("#openAiFields");
-  const get = (name) => panel.querySelector(`[name="${name}"]`).value.trim();
-  const number = (name) => Number(get(name));
-  if (kind === "volcengine_asr") {
-    return { ...common, parameters: { type: "volcengine_asr", api_variant: get("api_variant"), endpoint_override: get("endpoint_override") || null, app_id: get("app_id"), resource_id: get("resource_id"), model_or_cluster: get("model_or_cluster"), language: get("language"), request_timeout_seconds: number("request_timeout_seconds"), max_concurrent_sessions: number("max_concurrent_sessions"), max_session_seconds: number("max_session_seconds") }, secret: get("secret") || null };
-  }
-  return { ...common, parameters: { type: "open_ai_compatible_llm", base_url: get("base_url"), model: get("model"), structured_output_mode: get("structured_output_mode"), request_timeout_seconds: number("request_timeout_seconds"), max_output_tokens: number("max_output_tokens"), temperature: number("temperature") }, secret: get("secret") || null };
+  const descriptor = providerType(kind);
+  const parameters = { type: kind };
+  let secret = null;
+  descriptor?.fields.forEach((field) => {
+    const input = form.querySelector(`[name="${field.name}"]`);
+    if (!input) return;
+    const value = input.value.trim();
+    if (field.secret) secret = input.dataset.maskedSecret === "true" ? null : (value || null);
+    else parameters[field.name] = field.input === "number" ? Number(value) : value;
+  });
+  return { ...common, parameters, secret };
 }
 
 function editProfile(profileId) {
@@ -352,10 +414,10 @@ function initialize() {
   $("#profileForm").addEventListener("submit", saveProfile);
   $("#profilePipelineType").addEventListener("change", setProfilePipelineFields);
   $("#providerKind").addEventListener("change", setProviderKindFields);
-  $("#addProviderButton").addEventListener("click", openNewProvider);
+  ["#addAsrProviderButton", "#addLlmProviderButton", "#addTtsProviderButton"].forEach((selector) => $(selector).addEventListener("click", (event) => openNewProvider(event.currentTarget.dataset.providerCapability)));
   $("#addProfileButton").addEventListener("click", openNewProfile);
   document.querySelectorAll("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => closeDialog(`#${button.dataset.closeDialog}`)));
-  $("#providerRows").addEventListener("click", (event) => { const id = event.target.dataset.editProvider; if (id) editProvider(id); const deleteId = event.target.dataset.deleteProvider; if (deleteId) deleteProvider(deleteId); });
+  ["#asrProviderRows", "#llmProviderRows", "#ttsProviderRows"].forEach((selector) => $(selector).addEventListener("click", (event) => { const id = event.target.dataset.editProvider; if (id) editProvider(id); const deleteId = event.target.dataset.deleteProvider; if (deleteId) deleteProvider(deleteId); }));
   $("#profileRows").addEventListener("click", (event) => { const id = event.target.dataset.editProfile; if (id) editProfile(id); const deleteId = event.target.dataset.deleteProfile; if (deleteId) deleteProfile(deleteId); });
   $("#languageSelect").addEventListener("change", changeLanguage);
   $("#languageSelectApp").addEventListener("change", changeLanguage);

@@ -11,8 +11,9 @@ pub use catalog::{CatalogStore, GatewayCatalog};
 pub use completeness::{CaptureEvaluation, CaptureManifest, StreamCaptureEvaluation};
 pub use config::{
     CaptureThresholds, ExecutionConfig, GatewayConfig, GatewayProfileConfig, GatewayProviderConfig,
-    GatewayProviderKind, GatewayProviderParameters, ProviderRuntimeState, ProviderSecretStatus,
-    ProviderUpsertRequest, StorageLimits,
+    GatewayProviderKind, GatewayProviderParameters, ProviderFieldDescriptor, ProviderFieldOption,
+    ProviderRuntimeState, ProviderSecretStatus, ProviderTypeDescriptor, ProviderUpsertRequest,
+    StorageLimits,
 };
 pub use disk::{DiskAdmission, DiskAdmissionGuard, DiskUsage};
 pub use gateway::Gateway;

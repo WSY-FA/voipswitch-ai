@@ -1,6 +1,8 @@
 use crate::web::WebState;
 use crate::web::auth::{cookie_value, expired_session_cookie, session_cookie};
-use ai_gateway::{GatewayCatalog, GatewayProfileConfig, ProviderUpsertRequest};
+use ai_gateway::{
+    GatewayCatalog, GatewayProfileConfig, GatewayProviderKind, ProviderUpsertRequest,
+};
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -31,6 +33,7 @@ pub fn router() -> Router<SharedState> {
         .route("/api/auth/logout", axum::routing::post(logout))
         .route("/api/auth/me", get(current_user))
         .route("/api/catalog", get(catalog))
+        .route("/api/provider-types", get(provider_types))
         .route("/api/providers", put(upsert_provider))
         .route("/api/providers/:provider_id", delete(delete_provider))
         .route("/api/profiles", put(upsert_profile))
@@ -135,6 +138,14 @@ async fn catalog(State(state): State<SharedState>, headers: HeaderMap) -> Respon
             &error.to_string(),
         ),
     }
+}
+
+async fn provider_types(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if authenticated(&state, &headers).is_none() {
+        return auth_required();
+    }
+    Json(json!({ "ok": true, "provider_types": GatewayProviderKind::descriptors() }))
+        .into_response()
 }
 
 async fn upsert_provider(

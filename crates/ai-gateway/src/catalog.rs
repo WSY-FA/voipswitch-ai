@@ -5,7 +5,8 @@ use crate::config::{
 use ai_protocol::control::AiPipelineType;
 use ai_protocol::id::ProviderId;
 use ai_provider::{
-    LocalHttpAsrProvider, OpenAiCompatibleLlmConfig, OpenAiCompatibleLlmProvider, ProviderRegistry,
+    ByteDanceTtsConfig, ByteDanceTtsProvider, LocalHttpAsrProvider, OpenAiCompatibleLlmConfig,
+    OpenAiCompatibleLlmProvider, ProviderRegistry,
 };
 use anyhow::{Context, Result, bail};
 use argon2::Argon2;
@@ -134,6 +135,7 @@ impl CatalogStore {
             secret_cipher: SecretCipher::from_environment()?,
         };
         store.migrate_legacy_mock_catalog()?;
+        store.migrate_legacy_volcengine_catalog()?;
         store.migrate_provider_defaults()?;
         store.seed_if_empty(bootstrap)?;
         Ok(store)
@@ -162,8 +164,13 @@ impl CatalogStore {
                     serde_json::from_str(&kind_json).map_err(to_sql_error)?;
                 let parameters_json: String = row.get(5)?;
                 let parameters = serde_json::from_str(&parameters_json).map_err(to_sql_error)?;
-                let secret = load_secret_status(&connection, &provider_id, kind)
-                    .map_err(|error| to_sql_failure(error.to_string()))?;
+                let secret = load_secret_status(
+                    &connection,
+                    &provider_id,
+                    kind,
+                    self.secret_cipher.as_ref(),
+                )
+                .map_err(|error| to_sql_failure(error.to_string()))?;
                 let enabled = row.get::<_, i64>(3)? != 0;
                 let (runtime_state, runtime_message) =
                     runtime_state(kind, enabled, &secret, &parameters);
@@ -582,6 +589,62 @@ impl CatalogStore {
         Ok(())
     }
 
+    fn migrate_legacy_volcengine_catalog(&self) -> Result<()> {
+        let connection = self.connection.lock().unwrap();
+        let transaction = connection.unchecked_transaction()?;
+        let local_provider_id = transaction
+            .query_row(
+                "SELECT provider_id FROM gateway_provider
+                 WHERE kind IN ('\"local_http_asr\"', 'local_http_asr')
+                 ORDER BY provider_id LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let mut statement = transaction.prepare(
+            "SELECT provider_id FROM gateway_provider
+             WHERE kind IN ('\"volcengine_asr\"', 'volcengine_asr')",
+        )?;
+        let legacy_provider_ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        if legacy_provider_ids.is_empty() {
+            transaction.commit()?;
+            return Ok(());
+        }
+        for provider_id in &legacy_provider_ids {
+            if let Some(local_id) = &local_provider_id {
+                transaction.execute(
+                    "UPDATE gateway_profile SET asr_provider_id = ?1
+                     WHERE asr_provider_id = ?2",
+                    params![local_id, provider_id],
+                )?;
+            } else {
+                transaction.execute(
+                    "UPDATE gateway_profile SET enabled = 0, asr_provider_id = ''
+                     WHERE asr_provider_id = ?1",
+                    [provider_id],
+                )?;
+            }
+            transaction.execute(
+                "DELETE FROM gateway_provider_secret WHERE provider_id = ?1",
+                [provider_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM gateway_provider WHERE provider_id = ?1",
+                [provider_id],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO gateway_catalog_meta (key, value) VALUES ('catalog_version', 1)
+             ON CONFLICT(key) DO UPDATE SET value = value + 1",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn migrate_provider_defaults(&self) -> Result<()> {
         let connection = self.connection.lock().unwrap();
         let mut statement = connection.prepare(
@@ -716,6 +779,40 @@ pub fn build_provider_registry(
                     )?))
                     .map_err(anyhow::Error::msg)?;
             }
+            (
+                GatewayProviderParameters::ByteDanceTts {
+                    endpoint,
+                    app_id,
+                    cluster,
+                    voice_type,
+                    uid,
+                    language,
+                    sample_rate,
+                    request_timeout_seconds,
+                },
+                GatewayProviderKind::ByteDanceTts,
+            ) => {
+                let token =
+                    secret.context("enabled ByteDance TTS provider secret is not configured")?;
+                let config = ByteDanceTtsConfig {
+                    endpoint: endpoint.clone(),
+                    app_id: app_id.clone(),
+                    cluster: cluster.clone(),
+                    voice_type: voice_type.clone(),
+                    uid: uid.clone(),
+                    language: language.clone(),
+                    sample_rate: *sample_rate,
+                    request_timeout_seconds: *request_timeout_seconds,
+                    enabled: true,
+                };
+                registry
+                    .register_tts(std::sync::Arc::new(ByteDanceTtsProvider::new(
+                        ProviderId::new(provider.provider_id.clone())?,
+                        config,
+                        token,
+                    )?))
+                    .map_err(anyhow::Error::msg)?;
+            }
             _ => {}
         }
     }
@@ -744,9 +841,9 @@ fn runtime_state(
         );
     }
     match _kind {
-        GatewayProviderKind::LocalHttpAsr | GatewayProviderKind::OpenAiCompatibleLlm => {
-            (ProviderRuntimeState::Ready, None)
-        }
+        GatewayProviderKind::LocalHttpAsr
+        | GatewayProviderKind::OpenAiCompatibleLlm
+        | GatewayProviderKind::ByteDanceTts => (ProviderRuntimeState::Ready, None),
         GatewayProviderKind::VolcengineAsr => (
             ProviderRuntimeState::AdapterUnavailable,
             Some("provider_adapter_not_implemented".to_string()),
@@ -759,6 +856,7 @@ fn secret_name(kind: GatewayProviderKind) -> Option<&'static str> {
         GatewayProviderKind::LocalHttpAsr => None,
         GatewayProviderKind::VolcengineAsr => Some("access_token"),
         GatewayProviderKind::OpenAiCompatibleLlm => Some("api_key"),
+        GatewayProviderKind::ByteDanceTts => Some("access_token"),
     }
 }
 
@@ -766,20 +864,32 @@ fn load_secret_status(
     connection: &Connection,
     provider_id: &str,
     kind: GatewayProviderKind,
+    cipher: Option<&SecretCipher>,
 ) -> Result<ProviderSecretStatus> {
     let Some(secret_name) = secret_name(kind) else {
         return Ok(ProviderSecretStatus::default());
     };
     Ok(connection
         .query_row(
-            "SELECT masked, updated_at_ms FROM gateway_provider_secret
+            "SELECT ciphertext, nonce, masked, updated_at_ms FROM gateway_provider_secret
              WHERE provider_id = ?1 AND secret_name = ?2",
             params![provider_id, secret_name],
             |row| {
+                let ciphertext: Vec<u8> = row.get(0)?;
+                let nonce: Vec<u8> = row.get(1)?;
+                let stored_masked: String = row.get(2)?;
+                let masked = cipher
+                    .and_then(|cipher| {
+                        cipher
+                            .decrypt(provider_id, secret_name, &ciphertext, &nonce)
+                            .ok()
+                            .map(|secret| mask_secret(&secret))
+                    })
+                    .unwrap_or(stored_masked);
                 Ok(ProviderSecretStatus {
                     configured: true,
-                    masked: Some(row.get(0)?),
-                    updated_at_ms: Some(row.get::<_, i64>(1)? as u64),
+                    masked: Some(masked),
+                    updated_at_ms: Some(row.get::<_, i64>(3)? as u64),
                 })
             },
         )
@@ -788,8 +898,13 @@ fn load_secret_status(
 }
 
 fn mask_secret(secret: &str) -> String {
-    let suffix = secret.chars().rev().take(4).collect::<Vec<_>>();
-    format!("****{}", suffix.into_iter().rev().collect::<String>())
+    let chars = secret.chars().collect::<Vec<_>>();
+    if chars.len() <= 10 {
+        return "••••••••••".to_string();
+    }
+    let prefix = chars.iter().take(6).collect::<String>();
+    let suffix = chars.iter().rev().take(4).rev().collect::<String>();
+    format!("{prefix}{}{}", "•".repeat(25), suffix)
 }
 
 struct SecretCipher {
@@ -1017,13 +1132,13 @@ mod tests {
         let mut config = GatewayConfig::with_data_dir(data_dir.to_path_buf());
         config.providers = vec![
             GatewayProviderConfig {
-                provider_id: "volcengine-asr".to_string(),
-                display_name: "Volcengine ASR".to_string(),
-                kind: GatewayProviderKind::VolcengineAsr,
+                provider_id: "local-asr".to_string(),
+                display_name: "Local HTTP ASR".to_string(),
+                kind: GatewayProviderKind::LocalHttpAsr,
                 enabled: false,
                 revision: 1,
                 parameters: GatewayProviderParameters::defaults_for(
-                    GatewayProviderKind::VolcengineAsr,
+                    GatewayProviderKind::LocalHttpAsr,
                 ),
                 ..GatewayProviderConfig::default()
             },
@@ -1039,17 +1154,6 @@ mod tests {
                 ..GatewayProviderConfig::default()
             },
         ];
-        if let GatewayProviderParameters::VolcengineAsr {
-            app_id,
-            resource_id,
-            model_or_cluster,
-            ..
-        } = &mut config.providers[0].parameters
-        {
-            *app_id = "test-app".to_string();
-            *resource_id = "test-resource".to_string();
-            *model_or_cluster = "test-model".to_string();
-        }
         config.profiles = vec![GatewayProfileConfig::default()];
         config
     }
@@ -1086,7 +1190,7 @@ mod tests {
             .unwrap()
             .providers
             .into_iter()
-            .find(|provider| provider.kind == GatewayProviderKind::VolcengineAsr)
+            .find(|provider| provider.kind == GatewayProviderKind::LocalHttpAsr)
             .unwrap();
         let catalog = store
             .upsert_provider(ProviderUpsertRequest {
@@ -1104,7 +1208,7 @@ mod tests {
             catalog
                 .providers
                 .iter()
-                .find(|item| item.provider_id == "volcengine-asr")
+                .find(|item| item.provider_id == "local-asr")
                 .unwrap()
                 .revision,
             2
@@ -1231,7 +1335,11 @@ mod tests {
             .find(|provider| provider.provider_id == "llm-production")
             .unwrap();
         assert!(provider.secret.configured);
-        assert_eq!(provider.secret.masked.as_deref(), Some("****-key"));
+        let expected_mask = format!("top-se{}-key", "•".repeat(25));
+        assert_eq!(
+            provider.secret.masked.as_deref(),
+            Some(expected_mask.as_str())
+        );
         assert_eq!(provider.runtime_state, ProviderRuntimeState::Ready);
         assert!(
             !serde_json::to_string(provider)

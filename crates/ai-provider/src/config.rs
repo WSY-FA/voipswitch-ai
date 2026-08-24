@@ -16,6 +16,45 @@ pub struct LocalHttpTtsConfig {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByteDanceTtsConfig {
+    pub endpoint: String,
+    pub app_id: String,
+    pub cluster: String,
+    pub voice_type: String,
+    pub uid: String,
+    pub language: String,
+    pub sample_rate: u32,
+    pub request_timeout_seconds: u64,
+    pub enabled: bool,
+}
+
+impl ByteDanceTtsConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.endpoint != "https://openspeech.bytedance.com/api/v1/tts" {
+            return Err("endpoint must be the official ByteDance TTS v1 endpoint".to_string());
+        }
+        for (name, value) in [
+            ("app_id", self.app_id.as_str()),
+            ("cluster", self.cluster.as_str()),
+            ("voice_type", self.voice_type.as_str()),
+            ("uid", self.uid.as_str()),
+            ("language", self.language.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("{name} is required"));
+            }
+        }
+        if !matches!(self.sample_rate, 8000 | 16000) {
+            return Err("sample_rate must be 8000 or 16000".to_string());
+        }
+        if !(1..=600).contains(&self.request_timeout_seconds) {
+            return Err("request_timeout_seconds must be within 1..=600".to_string());
+        }
+        Ok(())
+    }
+}
+
 impl LocalHttpTtsConfig {
     pub fn validate(&self) -> Result<(), String> {
         if !(self.base_url.starts_with("http://") || self.base_url.starts_with("https://")) {
@@ -181,6 +220,22 @@ mod tests {
             request_timeout_seconds: 30,
             max_concurrent_sessions: 10,
             max_session_seconds: 14_400,
+            enabled: true,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validates_bytedance_tts_config() {
+        let config = ByteDanceTtsConfig {
+            endpoint: "https://openspeech.bytedance.com/api/v1/tts".to_string(),
+            app_id: "app-1".to_string(),
+            cluster: "volcano_tts".to_string(),
+            voice_type: "BV001_streaming".to_string(),
+            uid: "voipswitch".to_string(),
+            language: "zh".to_string(),
+            sample_rate: 16000,
+            request_timeout_seconds: 30,
             enabled: true,
         };
         assert!(config.validate().is_ok());

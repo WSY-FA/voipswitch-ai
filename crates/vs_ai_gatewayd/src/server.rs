@@ -5,8 +5,8 @@ use ai_protocol::control::{
     JobStatusRequest, ProfileCatalogRequest, ProtocolError,
 };
 use ai_protocol::frame::{read_json_frame, write_json_frame};
-use ai_protocol::id::{JobId, MessageId};
-use ai_protocol::media::read_media_frame;
+use ai_protocol::id::{ConversationId, JobId, MessageId};
+use ai_protocol::media::{read_media_frame, write_media_frame};
 use ai_protocol::time::unix_timestamp_ms;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
@@ -41,7 +41,7 @@ pub async fn run_media_socket(gateway: Arc<Gateway>, path: PathBuf) -> Result<()
     let listener = bind_listener(&path).await?;
     info!(socket = %path.display(), "AI media socket listening");
     loop {
-        let (mut stream, _) = listener.accept().await.context("accept AI media client")?;
+        let (stream, _) = listener.accept().await.context("accept AI media client")?;
         if let Ok(credentials) = stream.peer_cred() {
             debug!(
                 uid = credentials.uid(),
@@ -51,17 +51,35 @@ pub async fn run_media_socket(gateway: Arc<Gateway>, path: PathBuf) -> Result<()
         }
         let gateway = gateway.clone();
         tokio::spawn(async move {
+            let (mut reader, mut writer) = stream.into_split();
+            let mut outbound = gateway.subscribe_media();
             loop {
-                let frame = match read_media_frame(&mut stream).await {
-                    Ok(frame) => frame,
-                    Err(error) => {
-                        debug!(error = %error, "AI media client disconnected");
-                        return;
+                tokio::select! {
+                    inbound = read_media_frame(&mut reader) => {
+                        let frame = match inbound {
+                            Ok(frame) => frame,
+                            Err(error) => {
+                                debug!(error = %error, "AI media client disconnected");
+                                return;
+                            }
+                        };
+                        if let Err(error) = gateway.ingest_media(frame) {
+                            warn!(error = %error, "AI media frame rejected");
+                            continue;
+                        }
                     }
-                };
-                if let Err(error) = gateway.ingest_media(frame) {
-                    warn!(error = %error, "AI media frame rejected");
-                    return;
+                    event = outbound.recv() => match event {
+                        Ok(frame) => {
+                            if let Err(error) = write_media_frame(&mut writer, &frame).await {
+                                debug!(error = %error, "AI media client write failed");
+                                return;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(count)) => {
+                            warn!(count, "AI media client lagged; dropping stale TTS frames");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    }
                 }
             }
         });
@@ -84,6 +102,7 @@ async fn handle_control_client(
     let mut events = gateway.subscribe();
     let mut handshake_complete = false;
     let mut owned_jobs = BTreeSet::<JobId>::new();
+    let mut owned_conversations = BTreeSet::<ConversationId>::new();
     loop {
         tokio::select! {
             request = read_json_frame::<_, ControlEnvelope>(&mut reader) => {
@@ -94,6 +113,7 @@ async fn handle_control_client(
                     request,
                     &mut handshake_complete,
                     &mut owned_jobs,
+                    &mut owned_conversations,
                 ) {
                     Ok(responses) => responses,
                     Err(error) => vec![ControlMessage::Error(ProtocolError {
@@ -115,6 +135,20 @@ async fn handle_control_client(
                             &envelope(ControlMessage::JobCompleted(completed), &sequence)?,
                         ).await?;
                     }
+                Ok(ControlMessage::TtsStateChanged(state))
+                    if owned_conversations.contains(&state.conversation.conversation_id) => {
+                        write_json_frame(
+                            &mut writer,
+                            &envelope(ControlMessage::TtsStateChanged(state), &sequence)?,
+                        ).await?;
+                    }
+                Ok(ControlMessage::ActionRequested(action))
+                    if owned_conversations.contains(&action.conversation.conversation_id) => {
+                        write_json_frame(
+                            &mut writer,
+                            &envelope(ControlMessage::ActionRequested(action), &sequence)?,
+                        ).await?;
+                    }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(count)) => {
                     warn!(count, "AI control client event queue lagged; client must query job result");
@@ -130,6 +164,7 @@ fn dispatch(
     envelope: ControlEnvelope,
     handshake_complete: &mut bool,
     owned_jobs: &mut BTreeSet<JobId>,
+    owned_conversations: &mut BTreeSet<ConversationId>,
 ) -> Result<Vec<ControlMessage>> {
     envelope.validate()?;
     if !*handshake_complete {
@@ -194,12 +229,29 @@ fn dispatch(
             gateway.result_persisted(&message)?;
             Ok(vec![ControlMessage::JobStatus(gateway.status(&job)?)])
         }
-        ControlMessage::StartConversation(request) => Ok(vec![ControlMessage::ConversationReady(
-            gateway.start_conversation(request)?,
-        )]),
-        ControlMessage::StopConversation(request) => Ok(vec![ControlMessage::ConversationStopped(
-            gateway.stop_conversation(request)?,
-        )]),
+        ControlMessage::StartConversation(request) => {
+            owned_conversations.insert(request.conversation.conversation_id.clone());
+            Ok(vec![ControlMessage::ConversationReady(
+                gateway.start_conversation(request)?,
+            )])
+        }
+        ControlMessage::StopConversation(request) => {
+            owned_conversations.remove(&request.conversation.conversation_id);
+            Ok(vec![ControlMessage::ConversationStopped(
+                gateway.stop_conversation(request)?,
+            )])
+        }
+        ControlMessage::ActionResult(result) => {
+            owned_conversations.insert(result.conversation.conversation_id.clone());
+            info!(
+                conversation_id = %result.conversation.conversation_id,
+                operation_id = %result.operation_id,
+                success = result.success,
+                code = %result.code,
+                "voice-agent action result received"
+            );
+            Ok(Vec::new())
+        }
         _ => bail!("message type is not accepted from a connector"),
     }
 }
