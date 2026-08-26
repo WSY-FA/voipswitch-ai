@@ -238,6 +238,7 @@ async fn voice_agent_vad_turn_returns_pcm_tts_frames() {
                 sample_rate: 8_000,
                 channels: 1,
             },
+            welcome: None,
         })
         .unwrap();
     let mut output = gateway.subscribe_media();

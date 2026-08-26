@@ -108,6 +108,24 @@ async fn handle_control_client(
             request = read_json_frame::<_, ControlEnvelope>(&mut reader) => {
                 let request = request?;
                 let related = request.message_id.clone();
+                if handshake_complete && let ControlMessage::SynthesizeTts(tts) = request.message.clone() {
+                    info!(request_id = %tts.request_id, profile_id = %tts.profile_id, "TTS synthesis request received");
+                    let response = match gateway.synthesize_tts(tts.clone()).await {
+                        Ok(response) => {
+                            info!(request_id = %response.request_id, bytes = response.pcm16_le.len(), "TTS synthesis completed");
+                            ControlMessage::TtsSynthesized(response)
+                        },
+                        Err(error) => ControlMessage::TtsSynthesized(ai_protocol::control::TtsSynthesized {
+                            request_id: tts.request_id,
+                            success: false,
+                            pcm16_le: Vec::new(),
+                            sample_rate: 0,
+                            error: Some(error.to_string()),
+                        }),
+                    };
+                    write_json_frame(&mut writer, &envelope(response, &sequence)?).await?;
+                    continue;
+                }
                 let responses = match dispatch(
                     &gateway,
                     request,
@@ -234,6 +252,9 @@ fn dispatch(
             Ok(vec![ControlMessage::ConversationReady(
                 gateway.start_conversation(request)?,
             )])
+        }
+        ControlMessage::SynthesizeTts(_) => {
+            bail!("TTS synthesis requires an established connector")
         }
         ControlMessage::StopConversation(request) => {
             owned_conversations.remove(&request.conversation.conversation_id);

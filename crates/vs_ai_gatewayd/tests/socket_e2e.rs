@@ -268,6 +268,7 @@ async fn media_socket_returns_voice_agent_tts_on_the_same_connection() {
                 sample_rate: 8_000,
                 channels: 1,
             },
+            welcome: None,
         }),
     )
     .await;

@@ -53,7 +53,29 @@ pub enum ControlMessage {
     ActionRequested(ActionRequested),
     ActionResult(ActionResult),
     TtsStateChanged(TtsStateChanged),
+    SynthesizeTts(SynthesizeTts),
+    TtsSynthesized(TtsSynthesized),
     Error(ProtocolError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynthesizeTts {
+    pub request_id: String,
+    pub profile_id: ProfileId,
+    pub text: String,
+    #[serde(default)]
+    pub voice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TtsSynthesized {
+    pub request_id: String,
+    pub success: bool,
+    #[serde(default)]
+    pub pcm16_le: Vec<u8>,
+    #[serde(default)]
+    pub sample_rate: u32,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -62,6 +84,15 @@ pub struct StartConversation {
     pub profile: AiProfileSnapshot,
     pub participant: Participant,
     pub input_stream: StreamBinding,
+    #[serde(default)]
+    pub welcome: Option<WelcomePrompt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum WelcomePrompt {
+    Text(String),
+    PcmWav(Vec<u8>),
 }
 
 impl StartConversation {
@@ -78,6 +109,20 @@ impl StartConversation {
         }
         if self.input_stream.direction != MediaDirection::FromParticipant {
             bail!("conversation input stream must be from participant");
+        }
+        if let Some(welcome) = &self.welcome {
+            match welcome {
+                WelcomePrompt::Text(text) if text.trim().is_empty() => {
+                    bail!("welcome text must not be empty")
+                }
+                WelcomePrompt::Text(text) if text.len() > 2_000 => {
+                    bail!("welcome text is too long")
+                }
+                WelcomePrompt::PcmWav(bytes) if bytes.is_empty() || bytes.len() > 768 * 1024 => {
+                    bail!("welcome WAV must contain 1..=786432 bytes")
+                }
+                WelcomePrompt::Text(_) | WelcomePrompt::PcmWav(_) => {}
+            }
         }
         Ok(())
     }
@@ -165,6 +210,18 @@ impl ControlMessage {
             Self::ProfileCatalogSnapshot(snapshot) => snapshot.validate(),
             Self::StartConversation(request) => request.validate(),
             Self::ActionRequested(request) => request.validate(),
+            Self::SynthesizeTts(request) => {
+                if request.request_id.trim().is_empty() || request.request_id.len() > 128 {
+                    bail!("invalid TTS request id");
+                }
+                if request.text.trim().is_empty() || request.text.len() > 2_000 {
+                    bail!("invalid TTS text");
+                }
+                if request.voice.len() > 256 {
+                    bail!("TTS voice is too long");
+                }
+                Ok(())
+            }
             Self::EndAudioInput(request) if request.final_sequences.is_empty() => {
                 bail!("end_audio_input requires at least one final sequence")
             }

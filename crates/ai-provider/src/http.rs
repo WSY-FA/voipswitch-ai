@@ -58,10 +58,19 @@ impl LlmProvider for OpenAiCompatibleLlmProvider {
         } else {
             " Set action to null."
         };
+        let system_prompt = if request.allow_actions {
+            format!(
+                "只返回一个 JSON 对象，字段必须为 schema_version、summary、purpose、outcome、key_points、action_items、tags、action。schema_version 必须为 1。当前是实时语音坐席：summary 必须是可以直接播报给用户的简体中文短句，控制在 200 字以内；purpose、outcome、key_points、action_items、tags 只保留必要内容，数组最多各 3 项。除字段名和 action 结构中的固定枚举值外，不要输出英文、Markdown 或其他文字。参与方只能称为“主叫”或“被叫”。{action_instruction}"
+            )
+        } else {
+            format!(
+                "只返回一个 JSON 对象，字段必须为 schema_version、summary、purpose、outcome、key_points、action_items、tags、action。schema_version 必须为 1。除字段名和 action 结构中的固定枚举值外，summary、purpose、outcome、key_points、action_items、tags 的内容全部使用简体中文；参与方只能称为“主叫”或“被叫”，不要使用 caller、callee 或其他英文称呼；不要输出英文翻译，不要添加 Markdown 或其他文字。根据按时间排序的参与方转写内容分析整通电话，不要遗漏任一参与方。{action_instruction}"
+            )
+        };
         let mut body = json!({
             "model": self.config.model,
             "messages": [
-                {"role": "system", "content": format!("只返回一个 JSON 对象，字段必须为 schema_version、summary、purpose、outcome、key_points、action_items、tags、action。schema_version 必须为 1。除字段名和 action 结构中的固定枚举值外，summary、purpose、outcome、key_points、action_items、tags 的内容全部使用简体中文；参与方只能称为“主叫”或“被叫”，不要使用 caller、callee 或其他英文称呼；不要输出英文翻译，不要添加 Markdown 或其他文字。根据按时间排序的参与方转写内容分析整通电话，不要遗漏任一参与方。{action_instruction}")},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": serde_json::to_string(&transcript).map_err(|error| invalid_response(error.to_string()))?}
             ],
             "max_tokens": self.config.max_output_tokens,

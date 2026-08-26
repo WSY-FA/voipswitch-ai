@@ -7,6 +7,7 @@ use crate::config::{
 use crate::disk::{DiskAdmission, DiskAdmissionGuard, DiskUsage};
 use crate::store::{JobStore, StoredJob};
 use crate::voice_agent::VoiceAgentSession;
+use ai_protocol::control::WelcomePrompt;
 use ai_protocol::control::{
     ActionRequested, AiPipelineType, AiProfileProjection, AiProfileSnapshot, AudioInputReady,
     CaptureQuality, ControlMessage, ConversationReady, ConversationStopped, DurableAccepted,
@@ -54,7 +55,9 @@ struct VoiceConversation {
     buffered_frames: Vec<MediaFrame>,
     speech_frames: u16,
     silent_frames: u16,
+    barge_in_frames: u16,
     next_output_sequence: u64,
+    welcome_in_progress: bool,
 }
 
 struct VoiceTurn {
@@ -70,6 +73,9 @@ struct VoiceTurn {
 
 const VAD_MIN_SPEECH_FRAMES: u16 = 5;
 const VAD_END_SILENCE_FRAMES: u16 = 10;
+const BARGE_IN_MIN_SPEECH_FRAMES: u16 = 15;
+const BARGE_IN_MIN_ENERGY: u32 = 1_000;
+const VAD_MAX_SPEECH_FRAMES: usize = 250;
 const VAD_MAX_BUFFERED_FRAMES: usize = 1_500;
 
 impl Gateway {
@@ -153,19 +159,67 @@ impl Gateway {
             conversation: request.conversation.clone(),
             state: session.state(),
         };
+        let welcome_conversation = request.conversation.clone();
+        let welcome_profile = request.profile.clone();
+        let welcome_input_stream = request.input_stream.clone();
+        let welcome_in_progress = request.welcome.is_some();
         sessions.insert(
-            request.conversation.conversation_id,
+            request.conversation.conversation_id.clone(),
             VoiceConversation {
                 session,
-                profile: request.profile,
+                profile: request.profile.clone(),
                 participant: request.participant,
-                input_stream: request.input_stream,
+                input_stream: request.input_stream.clone(),
                 buffered_frames: Vec::new(),
                 speech_frames: 0,
                 silent_frames: 0,
+                barge_in_frames: 0,
                 next_output_sequence: 1,
+                welcome_in_progress,
             },
         );
+        if let Some(welcome) = request.welcome {
+            let conversation = welcome_conversation;
+            let profile = welcome_profile;
+            let input_stream = welcome_input_stream;
+            let providers = self.providers.read().unwrap().clone();
+            let events = self.events.clone();
+            let media_events = self.media_events.clone();
+            let sessions = self.voice_sessions.clone();
+            let sessions_for_error = sessions.clone();
+            let conversation_id = conversation.conversation_id.clone();
+            tokio::spawn(async move {
+                if let Err(error) = execute_welcome(
+                    welcome,
+                    conversation,
+                    profile,
+                    input_stream,
+                    providers,
+                    events.clone(),
+                    media_events,
+                    sessions,
+                )
+                .await
+                {
+                    warn!(error = %error, "voice-agent welcome prompt failed");
+                    let mut sessions_guard = sessions_for_error.lock().unwrap();
+                    if let Some(session) = sessions_guard.get_mut(&conversation_id) {
+                        session.welcome_in_progress = false;
+                        if session.session.state()
+                            == ai_protocol::control::ConversationState::Speaking
+                        {
+                            let _ = session.session.ready();
+                        }
+                        let _ = events.send(ControlMessage::TtsStateChanged(TtsStateChanged {
+                            conversation: session.session.conversation.clone(),
+                            generation: session.session.playback_generation,
+                            state: TtsState::Failed,
+                            sample_rate: None,
+                        }));
+                    }
+                }
+            });
+        }
         Ok(ready)
     }
 
@@ -177,6 +231,49 @@ impl Gateway {
         Ok(ConversationStopped {
             conversation: request.conversation,
             reason: request.reason,
+        })
+    }
+
+    pub async fn synthesize_tts(
+        &self,
+        request: ai_protocol::control::SynthesizeTts,
+    ) -> Result<ai_protocol::control::TtsSynthesized> {
+        let catalog = self.catalog.load()?;
+        let profile = catalog
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_id == request.profile_id.as_str())
+            .context("voice-agent profile not found")?;
+        if profile.pipeline_type != AiPipelineType::VoiceAgent {
+            bail!("profile is not a voice_agent profile");
+        }
+        let provider_id = profile
+            .tts_provider_id
+            .as_deref()
+            .context("voice-agent TTS provider missing")?;
+        let provider = self
+            .providers
+            .read()
+            .unwrap()
+            .tts(provider_id)
+            .context("voice-agent TTS provider unavailable")?;
+        let output = tokio::time::timeout(
+            Duration::from_secs(75),
+            provider.synthesize(TtsRequest {
+                operation_id: format!("config-{}", request.request_id),
+                text: request.text,
+                voice: request.voice,
+            }),
+        )
+        .await
+        .context("TTS provider timed out")?
+        .map_err(anyhow::Error::from)?;
+        Ok(ai_protocol::control::TtsSynthesized {
+            request_id: request.request_id,
+            success: true,
+            pcm16_le: output.pcm16_le,
+            sample_rate: output.sample_rate,
+            error: None,
         })
     }
 
@@ -391,24 +488,48 @@ impl Gateway {
         {
             bail!("voice conversation media identity does not match its input stream");
         }
-        if conversation.session.state() == ai_protocol::control::ConversationState::Speaking
-            && frame_has_voice(frame)
-        {
-            let generation = conversation.session.barge_in()?;
-            info!(conversation_id = %frame.metadata.conversation_id, generation, "voice-agent barge-in interrupted TTS");
-            let _ = self
-                .events
-                .send(ControlMessage::TtsStateChanged(TtsStateChanged {
-                    conversation: conversation.session.conversation.clone(),
-                    generation,
-                    state: TtsState::Interrupted,
-                    sample_rate: None,
-                }));
+        if conversation.session.state() == ai_protocol::control::ConversationState::Speaking {
+            // Ordinary handset comfort noise and acoustic echo can pass the normal
+            // VAD threshold. Only sustained, substantially stronger speech may
+            // interrupt TTS; otherwise every response is chopped after a few
+            // hundred milliseconds.
+            if mean_abs_for_codec(frame.metadata.codec, &frame.payload) >= BARGE_IN_MIN_ENERGY {
+                conversation.barge_in_frames = conversation.barge_in_frames.saturating_add(1);
+            } else {
+                conversation.barge_in_frames = 0;
+            }
+            if conversation.barge_in_frames >= BARGE_IN_MIN_SPEECH_FRAMES {
+                conversation.barge_in_frames = 0;
+                let generation = conversation.session.barge_in()?;
+                info!(conversation_id = %frame.metadata.conversation_id, generation, "voice-agent barge-in interrupted TTS");
+                let _ = self
+                    .events
+                    .send(ControlMessage::TtsStateChanged(TtsStateChanged {
+                        conversation: conversation.session.conversation.clone(),
+                        generation,
+                        state: TtsState::Interrupted,
+                        sample_rate: None,
+                    }));
+            }
+        }
+        if conversation.welcome_in_progress {
+            return Ok((true, None));
         }
         if conversation.session.state() != ai_protocol::control::ConversationState::Listening {
             return Ok((true, None));
         }
         let voice = frame_has_voice(frame);
+        if frame.metadata.sequence <= 5 || frame.metadata.sequence.is_multiple_of(25) {
+            info!(
+                conversation_id = %frame.metadata.conversation_id,
+                sequence = frame.metadata.sequence,
+                vad_energy = mean_abs_for_codec(frame.metadata.codec, &frame.payload),
+                vad_voice = voice,
+                speech_frames = conversation.speech_frames,
+                silent_frames = conversation.silent_frames,
+                "voice-agent VAD sample"
+            );
+        }
         if voice {
             conversation.speech_frames = conversation.speech_frames.saturating_add(1);
             conversation.silent_frames = 0;
@@ -421,8 +542,9 @@ impl Gateway {
                 conversation.buffered_frames.remove(0);
             }
         }
+        let max_speech_reached = conversation.buffered_frames.len() >= VAD_MAX_SPEECH_FRAMES;
         if conversation.speech_frames < VAD_MIN_SPEECH_FRAMES
-            || conversation.silent_frames < VAD_END_SILENCE_FRAMES
+            || (!max_speech_reached && conversation.silent_frames < VAD_END_SILENCE_FRAMES)
         {
             return Ok((true, None));
         }
@@ -919,26 +1041,57 @@ fn validate_media_identity(stored: &StoredJob, frame: &MediaFrame) -> Result<()>
 }
 
 fn frame_has_voice(frame: &MediaFrame) -> bool {
-    // G.711 zero/silence is codec dependent.  Count deviations from the common silence octets
-    // rather than decoding in the RTP hot path; the provider still receives the original audio.
-    let non_silence = match frame.metadata.codec {
-        ai_protocol::control::AudioCodec::Pcma => frame
-            .payload
-            .iter()
-            .filter(|sample| **sample != 0xd5 && **sample != 0x55)
-            .count(),
-        ai_protocol::control::AudioCodec::Pcmu => frame
-            .payload
-            .iter()
-            .filter(|sample| **sample != 0xff && **sample != 0x7f)
-            .count(),
-        ai_protocol::control::AudioCodec::Pcm16Le => frame
-            .payload
+    // Handsets often send low-level comfort noise instead of the canonical G.711 silence byte.
+    // Decode each frame and use mean absolute amplitude so VAD is stable across endpoints.
+    mean_abs_for_codec(frame.metadata.codec, &frame.payload) >= 128
+}
+
+fn mean_abs_for_codec(codec: ai_protocol::control::AudioCodec, payload: &[u8]) -> u32 {
+    let samples = match codec {
+        ai_protocol::control::AudioCodec::Pcma => {
+            return mean_abs(payload.iter().copied().map(alaw_to_pcm));
+        }
+        ai_protocol::control::AudioCodec::Pcmu => {
+            return mean_abs(payload.iter().copied().map(ulaw_to_pcm));
+        }
+        ai_protocol::control::AudioCodec::Pcm16Le => payload
             .chunks_exact(2)
-            .filter(|sample| i16::from_le_bytes([sample[0], sample[1]]).unsigned_abs() > 500)
-            .count(),
+            .map(|sample| i16::from_le_bytes([sample[0], sample[1]])),
     };
-    non_silence.saturating_mul(10) >= frame.payload.len().max(1)
+    mean_abs(samples)
+}
+
+fn mean_abs(samples: impl Iterator<Item = i16>) -> u32 {
+    let (sum, count) = samples.fold((0_u64, 0_u64), |(sum, count), sample| {
+        (sum + i64::from(sample).unsigned_abs(), count + 1)
+    });
+    sum.checked_div(count).unwrap_or(0) as u32
+}
+
+fn ulaw_to_pcm(value: u8) -> i16 {
+    let value = !value;
+    let sign = value & 0x80;
+    let exponent = i16::from((value >> 4) & 7);
+    let mantissa = i16::from(value & 0x0f);
+    let sample = ((mantissa << 3) + 0x84) << exponent;
+    if sign != 0 {
+        0x84 - sample
+    } else {
+        sample - 0x84
+    }
+}
+
+fn alaw_to_pcm(value: u8) -> i16 {
+    let value = value ^ 0x55;
+    let sign = value & 0x80;
+    let exponent = i16::from((value >> 4) & 7);
+    let mantissa = i16::from(value & 0x0f);
+    let sample = if exponent == 0 {
+        (mantissa << 4) + 8
+    } else {
+        ((mantissa << 4) + 0x108) << (exponent - 1)
+    };
+    if sign != 0 { sample } else { -sample }
 }
 
 async fn execute_voice_turn(
@@ -1001,37 +1154,59 @@ async fn execute_voice_turn(
         })
         .await
         .map_err(anyhow::Error::from)?;
-    info!(conversation_id = %turn.conversation.conversation_id, generation = turn.playback_generation, "voice-agent ASR completed");
-    let llm_output = llm
-        .summarize(LlmRequest {
-            operation_id: format!(
-                "{}-llm-{}",
-                turn.conversation.operation_id, turn.playback_generation
-            ),
-            transcript: transcript.segments,
-            allow_actions: true,
-        })
-        .await
-        .map_err(anyhow::Error::from)?;
-    info!(conversation_id = %turn.conversation.conversation_id, generation = turn.playback_generation, "voice-agent LLM completed");
-    if let Some(action) = llm_output.result.action.clone() {
-        let action_request = ActionRequested {
-            conversation: turn.conversation.clone(),
-            operation_id: ai_protocol::id::OperationId::new(format!(
-                "{}:action:{}",
-                turn.conversation.operation_id, turn.playback_generation
-            ))?,
-            generation: turn.conversation.generation,
-            action,
-            deadline_at_ms: unix_timestamp_ms().saturating_add(30_000),
-        };
-        let _ = events.send(ControlMessage::ActionRequested(action_request));
-        info!(conversation_id = %turn.conversation.conversation_id, generation = turn.playback_generation, "voice-agent action requested");
-    }
-    let text = llm_output.result.summary;
-    if text.trim().is_empty() {
-        bail!("voice-agent LLM returned an empty response");
-    }
+    let transcript_text = transcript
+        .segments
+        .iter()
+        .map(|segment| segment.text.as_str())
+        .collect::<Vec<_>>();
+    info!(
+        conversation_id = %turn.conversation.conversation_id,
+        generation = turn.playback_generation,
+        segments = transcript.segments.len(),
+        transcript = ?transcript_text,
+        "voice-agent ASR completed"
+    );
+    let text = if transcript.segments.is_empty() {
+        "抱歉，我没有听清，请您再说一遍。".to_string()
+    } else {
+        let llm_output = llm
+            .summarize(LlmRequest {
+                operation_id: format!(
+                    "{}-llm-{}",
+                    turn.conversation.operation_id, turn.playback_generation
+                ),
+                transcript: transcript.segments,
+                allow_actions: true,
+            })
+            .await
+            .map_err(anyhow::Error::from)?;
+        info!(conversation_id = %turn.conversation.conversation_id, generation = turn.playback_generation, "voice-agent LLM completed");
+        if let Some(action) = llm_output.result.action.clone() {
+            let action_request = ActionRequested {
+                conversation: turn.conversation.clone(),
+                operation_id: ai_protocol::id::OperationId::new(format!(
+                    "{}:action:{}",
+                    turn.conversation.operation_id, turn.playback_generation
+                ))?,
+                generation: turn.conversation.generation,
+                action,
+                deadline_at_ms: unix_timestamp_ms().saturating_add(30_000),
+            };
+            let _ = events.send(ControlMessage::ActionRequested(action_request));
+            info!(conversation_id = %turn.conversation.conversation_id, generation = turn.playback_generation, "voice-agent action requested");
+        }
+        llm_output.result.summary
+    };
+    let text = if text.trim().is_empty() {
+        warn!(
+            conversation_id = %turn.conversation.conversation_id,
+            generation = turn.playback_generation,
+            "voice-agent LLM returned an empty response; using repeat prompt"
+        );
+        "抱歉，我没有听清，请您再说一遍。".to_string()
+    } else {
+        text
+    };
     let audio = tts
         .synthesize(TtsRequest {
             operation_id: format!(
@@ -1074,6 +1249,9 @@ async fn execute_voice_turn(
     let output_stream =
         ai_protocol::id::StreamId::new(format!("{}-tts", turn.input_stream.stream_id.as_str()))?;
     let frame_bytes = 640; // 20 ms * 16 kHz * mono * PCM16LE
+    // Pace against an absolute clock so IPC scheduling time does not accumulate and
+    // stretch the audio. The Core RTP sender uses the same strategy.
+    let mut next_frame_at = tokio::time::Instant::now();
     for (offset, payload) in audio.pcm16_le.chunks(frame_bytes).enumerate() {
         let still_speaking = {
             let sessions = sessions.lock().unwrap();
@@ -1088,6 +1266,8 @@ async fn execute_voice_turn(
         if !still_speaking {
             return Ok(());
         }
+        tokio::time::sleep_until(next_frame_at).await;
+        next_frame_at += Duration::from_millis(20);
         let frame = MediaFrame {
             metadata: MediaFrameMetadata {
                 job_id: turn.conversation.job_id.clone(),
@@ -1139,6 +1319,174 @@ async fn execute_voice_turn(
     Ok(())
 }
 
+async fn execute_welcome(
+    welcome: WelcomePrompt,
+    conversation: JobRef,
+    profile: AiProfileSnapshot,
+    input_stream: ai_protocol::control::StreamBinding,
+    providers: Arc<ProviderRegistry>,
+    events: broadcast::Sender<ControlMessage>,
+    media_events: broadcast::Sender<MediaFrame>,
+    sessions: Arc<Mutex<std::collections::BTreeMap<ConversationId, VoiceConversation>>>,
+) -> Result<()> {
+    let pcm16_le = match welcome {
+        WelcomePrompt::Text(text) => {
+            let tts_id = profile
+                .tts_provider_id
+                .as_deref()
+                .context("welcome text requires a TTS provider")?;
+            let tts = providers
+                .tts(tts_id)
+                .context("welcome TTS provider unavailable")?;
+            tts.synthesize(TtsRequest {
+                operation_id: format!("{}-welcome", conversation.operation_id),
+                text,
+                voice: String::new(),
+            })
+            .await
+            .map_err(anyhow::Error::from)?
+            .pcm16_le
+        }
+        WelcomePrompt::PcmWav(bytes) => decode_pcm_wav(&bytes)?,
+    };
+    if pcm16_le.is_empty() || !pcm16_le.len().is_multiple_of(2) {
+        bail!("welcome audio must contain non-empty PCM16LE");
+    }
+    let (generation, mut sequence) = {
+        let mut sessions_guard = sessions.lock().unwrap();
+        let session = sessions_guard
+            .get_mut(&conversation.conversation_id)
+            .context("welcome conversation is no longer active")?;
+        if session.session.conversation != conversation {
+            bail!("welcome conversation identity mismatch");
+        }
+        if session.session.state() == ai_protocol::control::ConversationState::Listening {
+            session.session.begin_thinking()?;
+        }
+        let generation = session.session.begin_speaking()?;
+        let sequence = session.next_output_sequence;
+        session.next_output_sequence = sequence;
+        (generation, sequence)
+    };
+    let _ = events.send(ControlMessage::TtsStateChanged(TtsStateChanged {
+        conversation: conversation.clone(),
+        generation,
+        state: TtsState::Started,
+        sample_rate: Some(16_000),
+    }));
+    let output_stream =
+        ai_protocol::id::StreamId::new(format!("{}-welcome", input_stream.stream_id.as_str()))?;
+    let mut next_at = tokio::time::Instant::now();
+    for (offset, payload) in pcm16_le.chunks(640).enumerate() {
+        let still_speaking = {
+            let sessions_guard = sessions.lock().unwrap();
+            sessions_guard
+                .get(&conversation.conversation_id)
+                .is_some_and(|session| {
+                    session.session.playback_generation == generation
+                        && session.session.state()
+                            == ai_protocol::control::ConversationState::Speaking
+                })
+        };
+        if !still_speaking {
+            let mut sessions_guard = sessions.lock().unwrap();
+            if let Some(session) = sessions_guard.get_mut(&conversation.conversation_id) {
+                session.welcome_in_progress = false;
+            }
+            return Ok(());
+        }
+        tokio::time::sleep_until(next_at).await;
+        let frame = MediaFrame {
+            metadata: MediaFrameMetadata {
+                job_id: conversation.job_id.clone(),
+                tenant_id: conversation.tenant_id.clone(),
+                conversation_id: conversation.conversation_id.clone(),
+                participant_id: input_stream.participant_id.clone(),
+                stream_id: output_stream.clone(),
+                sequence,
+                generation,
+                direction: ai_protocol::control::MediaDirection::ToParticipant,
+                codec: ai_protocol::control::AudioCodec::Pcm16Le,
+                sample_rate: 16_000,
+                channels: 1,
+                media_timestamp: (offset as u64) * 320,
+                duration_ms: 20,
+                end_of_stream: false,
+            },
+            payload: payload.to_vec(),
+        };
+        if media_events.send(frame).is_err() {
+            bail!("voice-agent welcome media consumer is unavailable");
+        }
+        sequence = sequence.saturating_add(1);
+        next_at += Duration::from_millis(20);
+    }
+    let mut sessions_guard = sessions.lock().unwrap();
+    if let Some(session) = sessions_guard.get_mut(&conversation.conversation_id)
+        && session.session.playback_generation == generation
+        && session.session.state() == ai_protocol::control::ConversationState::Speaking
+    {
+        session.next_output_sequence = sequence;
+        session.session.ready()?;
+        session.welcome_in_progress = false;
+        let _ = events.send(ControlMessage::TtsStateChanged(TtsStateChanged {
+            conversation,
+            generation,
+            state: TtsState::Stopped,
+            sample_rate: Some(16_000),
+        }));
+    }
+    Ok(())
+}
+
+fn decode_pcm_wav(bytes: &[u8]) -> Result<Vec<u8>> {
+    if bytes.len() < 44 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        bail!("welcome audio must be a RIFF/WAVE file");
+    }
+    let mut offset = 12;
+    let mut channels = 0_u16;
+    let mut sample_rate = 0_u32;
+    let mut bits = 0_u16;
+    let mut data = None;
+    while offset + 8 <= bytes.len() {
+        let id = &bytes[offset..offset + 4];
+        let len = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        offset += 8;
+        if offset + len > bytes.len() {
+            bail!("welcome WAV chunk exceeds file size");
+        }
+        match id {
+            b"fmt " if len >= 16 => {
+                let format = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap());
+                channels = u16::from_le_bytes(bytes[offset + 2..offset + 4].try_into().unwrap());
+                sample_rate = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+                bits = u16::from_le_bytes(bytes[offset + 14..offset + 16].try_into().unwrap());
+                if format != 1
+                    || channels != 1
+                    || bits != 16
+                    || !matches!(sample_rate, 8_000 | 16_000)
+                {
+                    bail!("welcome WAV must be PCM16LE mono at 8000 or 16000 Hz");
+                }
+            }
+            b"data" => data = Some(bytes[offset..offset + len].to_vec()),
+            _ => {}
+        }
+        offset += len + (len % 2);
+    }
+    let pcm = data.context("welcome WAV data chunk is missing")?;
+    if sample_rate == 8_000 {
+        let mut upsampled = Vec::with_capacity(pcm.len() * 2);
+        for sample in pcm.chunks_exact(2) {
+            upsampled.extend_from_slice(sample);
+            upsampled.extend_from_slice(sample);
+        }
+        Ok(upsampled)
+    } else {
+        Ok(pcm)
+    }
+}
+
 fn thresholds_for(stored: &StoredJob) -> Result<CaptureThresholds> {
     let profile = &stored.request.profile;
     let thresholds = CaptureThresholds {
@@ -1176,4 +1524,30 @@ fn validate_result(result: &ai_protocol::control::StructuredCallResult) -> Resul
 
 fn hours_ms(hours: u64) -> u64 {
     hours.saturating_mul(60 * 60 * 1000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BARGE_IN_MIN_ENERGY, alaw_to_pcm, mean_abs_for_codec, ulaw_to_pcm};
+    use ai_protocol::control::AudioCodec;
+
+    #[test]
+    fn vad_rejects_g711_silence_and_accepts_speech_energy() {
+        assert!(mean_abs_for_codec(AudioCodec::Pcma, &[0xd5; 160]) < 128);
+        assert!(mean_abs_for_codec(AudioCodec::Pcmu, &[0xff; 160]) < 128);
+        assert!(mean_abs_for_codec(AudioCodec::Pcma, &[0x80; 160]) >= 128);
+        assert!(mean_abs_for_codec(AudioCodec::Pcmu, &[0x00; 160]) >= 128);
+    }
+
+    #[test]
+    fn g711_decoders_keep_silence_near_zero() {
+        assert!(alaw_to_pcm(0xd5).unsigned_abs() <= 8);
+        assert!(ulaw_to_pcm(0xff).unsigned_abs() <= 1);
+    }
+
+    #[test]
+    fn barge_in_requires_stronger_energy_than_vad() {
+        assert!(mean_abs_for_codec(AudioCodec::Pcma, &[0x80; 160]) >= BARGE_IN_MIN_ENERGY);
+        assert!(mean_abs_for_codec(AudioCodec::Pcma, &[0xd5; 160]) < BARGE_IN_MIN_ENERGY);
+    }
 }
