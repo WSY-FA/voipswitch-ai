@@ -49,6 +49,10 @@ pub struct MockLlmProvider {
     provider_id: ProviderId,
 }
 
+pub struct TransferLlmProvider {
+    provider_id: ProviderId,
+}
+
 pub struct MockTtsProvider {
     provider_id: ProviderId,
 }
@@ -80,6 +84,12 @@ impl MockLlmProvider {
     }
 }
 
+impl TransferLlmProvider {
+    pub fn new(provider_id: ProviderId) -> Self {
+        Self { provider_id }
+    }
+}
+
 #[async_trait]
 impl LlmProvider for MockLlmProvider {
     fn provider_id(&self) -> &ProviderId {
@@ -98,6 +108,33 @@ impl LlmProvider for MockLlmProvider {
                 action_items: Vec::new(),
                 tags: vec!["mock".to_string()],
                 action: None,
+            },
+            input_tokens: None,
+            output_tokens: None,
+        })
+    }
+}
+
+#[async_trait]
+impl LlmProvider for TransferLlmProvider {
+    fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    async fn summarize(&self, _request: LlmRequest) -> ProviderResult<LlmOutput> {
+        Ok(LlmOutput {
+            request_id: Some("transfer-llm:1".to_string()),
+            result: StructuredCallResult {
+                schema_version: 1,
+                summary: "正在为您转接分机 1002".to_string(),
+                purpose: "转接".to_string(),
+                outcome: "已请求转接".to_string(),
+                key_points: Vec::new(),
+                action_items: Vec::new(),
+                tags: Vec::new(),
+                action: Some(ai_protocol::control::AgentAction::TransferToExtension {
+                    number: "1002".to_string(),
+                }),
             },
             input_tokens: None,
             output_tokens: None,

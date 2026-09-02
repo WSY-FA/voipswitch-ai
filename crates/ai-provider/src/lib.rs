@@ -10,7 +10,7 @@ pub use config::{
 pub use http::{
     ByteDanceTtsProvider, LocalHttpAsrProvider, LocalHttpTtsProvider, OpenAiCompatibleLlmProvider,
 };
-pub use mock::{MockAsrProvider, MockLlmProvider, MockTtsProvider};
+pub use mock::{MockAsrProvider, MockLlmProvider, MockTtsProvider, TransferLlmProvider};
 pub use registry::ProviderRegistry;
 
 use ai_protocol::control::{StructuredCallResult, TranscriptSegment};

@@ -9,11 +9,11 @@ use crate::store::{JobStore, StoredJob};
 use crate::voice_agent::VoiceAgentSession;
 use ai_protocol::control::WelcomePrompt;
 use ai_protocol::control::{
-    ActionRequested, AiPipelineType, AiProfileProjection, AiProfileSnapshot, AudioInputReady,
-    CaptureQuality, ControlMessage, ConversationReady, ConversationStopped, DurableAccepted,
-    EndAudioInput, JobCompleted, JobRef, JobState, JobStatus, ProfileCatalogSnapshot,
-    ResultPersisted, StartConversation, StopConversation, SubmitPostCallJob, TtsState,
-    TtsStateChanged,
+    ActionRequested, ActionResult, AgentAction, AiPipelineType, AiProfileProjection,
+    AiProfileSnapshot, AudioInputReady, CaptureQuality, ControlMessage, ConversationReady,
+    ConversationStopped, DurableAccepted, EndAudioInput, JobCompleted, JobRef, JobState, JobStatus,
+    ProfileCatalogSnapshot, ResultPersisted, StartConversation, StopConversation,
+    SubmitPostCallJob, TtsState, TtsStateChanged,
 };
 use ai_protocol::id::{ConversationId, JobId, ProfileId};
 use ai_protocol::media::{MediaFrame, MediaFrameMetadata};
@@ -57,6 +57,7 @@ struct VoiceConversation {
     silent_frames: u16,
     barge_in_frames: u16,
     next_output_sequence: u64,
+    next_action_sequence: u64,
     welcome_in_progress: bool,
 }
 
@@ -175,6 +176,7 @@ impl Gateway {
                 silent_frames: 0,
                 barge_in_frames: 0,
                 next_output_sequence: 1,
+                next_action_sequence: 1,
                 welcome_in_progress,
             },
         );
@@ -232,6 +234,31 @@ impl Gateway {
             conversation: request.conversation,
             reason: request.reason,
         })
+    }
+
+    pub fn action_result(&self, result: &ActionResult) -> Result<()> {
+        let mut sessions = self.voice_sessions.lock().unwrap();
+        let Some(session) = sessions.get_mut(&result.conversation.conversation_id) else {
+            return Ok(());
+        };
+        if session.session.conversation != result.conversation {
+            bail!("voice-agent action result conversation does not match active session");
+        }
+        if !result.success
+            && session.session.state() == ai_protocol::control::ConversationState::Thinking
+        {
+            session.session.resume_after_action_failure()?;
+            session.speech_frames = 0;
+            session.silent_frames = 0;
+            session.barge_in_frames = 0;
+            info!(
+                conversation_id = %result.conversation.conversation_id,
+                operation_id = %result.operation_id,
+                code = %result.code,
+                "voice-agent action failed; conversation resumed"
+            );
+        }
+        Ok(())
     }
 
     pub async fn synthesize_tts(
@@ -1182,11 +1209,28 @@ async fn execute_voice_turn(
             .map_err(anyhow::Error::from)?;
         info!(conversation_id = %turn.conversation.conversation_id, generation = turn.playback_generation, "voice-agent LLM completed");
         if let Some(action) = llm_output.result.action.clone() {
+            let transfer_action = matches!(
+                action,
+                AgentAction::TransferToExtension { .. }
+                    | AgentAction::TransferToBusinessTarget { .. }
+            );
+            let action_sequence = {
+                let mut sessions = sessions.lock().unwrap();
+                let session = sessions
+                    .get_mut(&turn.conversation.conversation_id)
+                    .context("voice conversation stopped before action request")?;
+                if session.session.conversation != turn.conversation {
+                    bail!("voice conversation identity mismatch before action request");
+                }
+                let sequence = session.next_action_sequence;
+                session.next_action_sequence = sequence.saturating_add(1);
+                sequence
+            };
             let action_request = ActionRequested {
                 conversation: turn.conversation.clone(),
                 operation_id: ai_protocol::id::OperationId::new(format!(
                     "{}:action:{}",
-                    turn.conversation.operation_id, turn.playback_generation
+                    turn.conversation.operation_id, action_sequence
                 ))?,
                 generation: turn.conversation.generation,
                 action,
@@ -1194,6 +1238,9 @@ async fn execute_voice_turn(
             };
             let _ = events.send(ControlMessage::ActionRequested(action_request));
             info!(conversation_id = %turn.conversation.conversation_id, generation = turn.playback_generation, "voice-agent action requested");
+            if transfer_action {
+                return Ok(());
+            }
         }
         llm_output.result.summary
     };
@@ -1319,6 +1366,7 @@ async fn execute_voice_turn(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_welcome(
     welcome: WelcomePrompt,
     conversation: JobRef,
@@ -1365,7 +1413,6 @@ async fn execute_welcome(
         }
         let generation = session.session.begin_speaking()?;
         let sequence = session.next_output_sequence;
-        session.next_output_sequence = sequence;
         (generation, sequence)
     };
     let _ = events.send(ControlMessage::TtsStateChanged(TtsStateChanged {
@@ -1439,14 +1486,15 @@ async fn execute_welcome(
     Ok(())
 }
 
+#[allow(unused_assignments)]
 fn decode_pcm_wav(bytes: &[u8]) -> Result<Vec<u8>> {
     if bytes.len() < 44 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         bail!("welcome audio must be a RIFF/WAVE file");
     }
     let mut offset = 12;
-    let mut channels = 0_u16;
-    let mut sample_rate = 0_u32;
-    let mut bits = 0_u16;
+    let mut channels = None;
+    let mut sample_rate = None;
+    let mut bits = None;
     let mut data = None;
     while offset + 8 <= bytes.len() {
         let id = &bytes[offset..offset + 4];
@@ -1458,13 +1506,19 @@ fn decode_pcm_wav(bytes: &[u8]) -> Result<Vec<u8>> {
         match id {
             b"fmt " if len >= 16 => {
                 let format = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap());
-                channels = u16::from_le_bytes(bytes[offset + 2..offset + 4].try_into().unwrap());
-                sample_rate = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
-                bits = u16::from_le_bytes(bytes[offset + 14..offset + 16].try_into().unwrap());
+                channels = Some(u16::from_le_bytes(
+                    bytes[offset + 2..offset + 4].try_into().unwrap(),
+                ));
+                sample_rate = Some(u32::from_le_bytes(
+                    bytes[offset + 4..offset + 8].try_into().unwrap(),
+                ));
+                bits = Some(u16::from_le_bytes(
+                    bytes[offset + 14..offset + 16].try_into().unwrap(),
+                ));
                 if format != 1
-                    || channels != 1
-                    || bits != 16
-                    || !matches!(sample_rate, 8_000 | 16_000)
+                    || channels != Some(1)
+                    || bits != Some(16)
+                    || !matches!(sample_rate, Some(8_000 | 16_000))
                 {
                     bail!("welcome WAV must be PCM16LE mono at 8000 or 16000 Hz");
                 }
@@ -1475,7 +1529,7 @@ fn decode_pcm_wav(bytes: &[u8]) -> Result<Vec<u8>> {
         offset += len + (len % 2);
     }
     let pcm = data.context("welcome WAV data chunk is missing")?;
-    if sample_rate == 8_000 {
+    if sample_rate == Some(8_000) {
         let mut upsampled = Vec::with_capacity(pcm.len() * 2);
         for sample in pcm.chunks_exact(2) {
             upsampled.extend_from_slice(sample);

@@ -1,14 +1,16 @@
 use ai_gateway::{Gateway, GatewayConfig, GatewayProfileConfig};
 use ai_protocol::control::{
-    AiPipelineType, AiProfileSnapshot, AudioCodec, ControlMessage, EndAudioInput, JobRef, JobState,
-    MediaDirection, Participant, ResultPersisted, StartConversation, StreamBinding,
-    SubmitPostCallJob,
+    ActionResult, AgentAction, AiPipelineType, AiProfileSnapshot, AudioCodec, ControlMessage,
+    EndAudioInput, JobRef, JobState, MediaDirection, Participant, ResultPersisted,
+    StartConversation, StreamBinding, SubmitPostCallJob,
 };
 use ai_protocol::id::{
     ConversationId, JobId, OperationId, ParticipantId, ProfileId, ProviderId, StreamId, TenantId,
 };
 use ai_protocol::media::{MediaFrame, MediaFrameMetadata};
-use ai_provider::{MockAsrProvider, MockLlmProvider, MockTtsProvider, ProviderRegistry};
+use ai_provider::{
+    MockAsrProvider, MockLlmProvider, MockTtsProvider, ProviderRegistry, TransferLlmProvider,
+};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -260,6 +262,139 @@ async fn voice_agent_vad_turn_returns_pcm_tts_frames() {
     assert_eq!(frame.metadata.codec, AudioCodec::Pcm16Le);
     assert_eq!(frame.metadata.sample_rate, 16_000);
     assert_eq!(frame.payload.len(), 640);
+}
+
+#[tokio::test]
+async fn voice_agent_emits_transfer_action_from_llm_result() {
+    let directory = tempdir().unwrap();
+    let mut config = GatewayConfig::with_data_dir(directory.path().to_path_buf());
+    config.storage.disk_min_free_mb = 1;
+    config.profiles = vec![GatewayProfileConfig {
+        profile_id: "voice-profile".to_string(),
+        profile_version: 1,
+        enabled: true,
+        pipeline_type: AiPipelineType::VoiceAgent,
+        asr_provider_id: Some("mock-asr".to_string()),
+        llm_provider_id: Some("transfer-llm".to_string()),
+        tts_provider_id: Some("mock-tts".to_string()),
+        capture: Default::default(),
+    }];
+    let mut providers = ProviderRegistry::default();
+    providers
+        .register_asr(Arc::new(MockAsrProvider::new(
+            ProviderId::new("mock-asr").unwrap(),
+        )))
+        .unwrap();
+    providers
+        .register_llm(Arc::new(TransferLlmProvider::new(
+            ProviderId::new("transfer-llm").unwrap(),
+        )))
+        .unwrap();
+    providers
+        .register_tts(Arc::new(MockTtsProvider::new(
+            ProviderId::new("mock-tts").unwrap(),
+        )))
+        .unwrap();
+    let gateway = Gateway::open(config, Arc::new(providers), "transfer-test".to_string()).unwrap();
+    let mut events = gateway.subscribe();
+    let job = JobRef {
+        job_id: JobId::new("transfer-job").unwrap(),
+        tenant_id: TenantId::new("tenant-1").unwrap(),
+        conversation_id: ConversationId::new("transfer-call").unwrap(),
+        operation_id: OperationId::new("voice-agent-v1").unwrap(),
+        generation: 1,
+    };
+    let participant = Participant {
+        participant_id: ParticipantId::new("caller").unwrap(),
+        role: "caller".to_string(),
+        display_number: Some("1001".to_string()),
+    };
+    gateway
+        .start_conversation(StartConversation {
+            conversation: job.clone(),
+            profile: AiProfileSnapshot {
+                profile_id: ProfileId::new("voice-profile").unwrap(),
+                profile_version: 1,
+                pipeline_type: AiPipelineType::VoiceAgent,
+                asr_provider_id: Some("mock-asr".to_string()),
+                llm_provider_id: Some("transfer-llm".to_string()),
+                tts_provider_id: Some("mock-tts".to_string()),
+                capture_complete_ratio: 0.995,
+                capture_process_min_ratio: 0.95,
+                capture_complete_max_gap_ms: 200,
+                capture_process_max_gap_ms: 5_000,
+            },
+            participant: participant.clone(),
+            input_stream: StreamBinding {
+                stream_id: StreamId::new("caller-audio").unwrap(),
+                participant_id: participant.participant_id,
+                direction: MediaDirection::FromParticipant,
+                codec: AudioCodec::Pcma,
+                sample_rate: 8_000,
+                channels: 1,
+            },
+            welcome: None,
+        })
+        .unwrap();
+    for sequence in 0..5 {
+        gateway
+            .ingest_media(voice_frame(&job, sequence, vec![0; 160]))
+            .unwrap();
+    }
+    for sequence in 5..15 {
+        gateway
+            .ingest_media(voice_frame(&job, sequence, vec![0xd5; 160]))
+            .unwrap();
+    }
+    let action = loop {
+        let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let ControlMessage::ActionRequested(action) = event {
+            break action;
+        }
+    };
+    assert_eq!(action.conversation, job);
+    assert!(matches!(
+        action.action,
+        AgentAction::TransferToExtension { ref number } if number == "1002"
+    ));
+    let operation_id = action.operation_id.clone();
+    gateway
+        .action_result(&ActionResult {
+            conversation: action.conversation,
+            operation_id: operation_id.clone(),
+            generation: action.generation,
+            success: false,
+            code: "TRANSFER_FAILED".to_string(),
+            message: Some("extension unavailable".to_string()),
+        })
+        .unwrap();
+    for sequence in 20..25 {
+        gateway
+            .ingest_media(voice_frame(&job, sequence, vec![0; 160]))
+            .unwrap();
+    }
+    for sequence in 25..35 {
+        gateway
+            .ingest_media(voice_frame(&job, sequence, vec![0xd5; 160]))
+            .unwrap();
+    }
+    let resumed_action = loop {
+        let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let ControlMessage::ActionRequested(action) = event {
+            break action;
+        }
+    };
+    assert!(matches!(
+        resumed_action.action,
+        AgentAction::TransferToExtension { ref number } if number == "1002"
+    ));
+    assert_ne!(resumed_action.operation_id, operation_id);
 }
 
 fn voice_frame(job: &JobRef, sequence: u64, payload: Vec<u8>) -> MediaFrame {

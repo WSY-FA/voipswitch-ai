@@ -32,6 +32,9 @@ impl VoiceAgentSession {
         self.transition(ConversationState::Speaking)?;
         Ok(self.playback_generation)
     }
+    pub fn resume_after_action_failure(&mut self) -> Result<()> {
+        self.transition(ConversationState::Listening)
+    }
     pub fn barge_in(&mut self) -> Result<u64> {
         if self.state != ConversationState::Speaking {
             bail!("barge-in is only valid while speaking");
@@ -55,6 +58,7 @@ impl VoiceAgentSession {
             (self.state, next),
             (ConversationState::Starting, ConversationState::Listening)
                 | (ConversationState::Listening, ConversationState::Thinking)
+                | (ConversationState::Thinking, ConversationState::Listening)
                 | (ConversationState::Thinking, ConversationState::Speaking)
                 | (ConversationState::Speaking, ConversationState::Listening)
                 | (ConversationState::Listening, ConversationState::Stopping)

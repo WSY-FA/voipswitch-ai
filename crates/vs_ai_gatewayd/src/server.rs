@@ -264,6 +264,7 @@ fn dispatch(
         }
         ControlMessage::ActionResult(result) => {
             owned_conversations.insert(result.conversation.conversation_id.clone());
+            gateway.action_result(&result)?;
             info!(
                 conversation_id = %result.conversation.conversation_id,
                 operation_id = %result.operation_id,
