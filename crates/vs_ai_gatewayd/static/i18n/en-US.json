@@ -94,6 +94,7 @@
   "form.type": "Type",
   "provider.typeUnavailable": "The provider adapter is not loaded",
   "pipeline.transcription": "Transcription only",
+  "pipeline.realtimeAssist": "Real-time agent assist",
   "pipeline.postCallAnalysis": "Post-call analysis",
   "pipeline.llmTask": "Text-only LLM task",
   "pipeline.voiceAgent": "AI voice agent",
@@ -134,5 +135,18 @@
   "errors.AI_ADMIN_REJECTED": "Gateway rejected this configuration.",
   "errors.AI_GATEWAY_UNAVAILABLE": "Gateway is currently unavailable.",
   "errors.unknown": "The operation failed. Please try again.",
-  "actions.close": "Close"
+  "actions.close": "Close",
+  "nav.assist": "Live assist",
+  "assist.title": "Real-time agent assist",
+  "assist.conversationId": "Conversation ID",
+  "assist.connect": "Connect",
+  "assist.disconnect": "Disconnect",
+  "assist.disconnected": "Disconnected",
+  "assist.connected": "Connected: {id}",
+  "assist.reconnecting": "Connection interrupted, reconnecting",
+  "assist.invalidConversation": "Enter a valid conversation ID",
+  "assist.eventTime": "Time",
+  "assist.eventType": "Event",
+  "assist.eventText": "Content",
+  "assist.empty": "Live transcripts and suggestions appear after connecting"
 }

@@ -10,10 +10,11 @@ use crate::voice_agent::VoiceAgentSession;
 use ai_protocol::control::WelcomePrompt;
 use ai_protocol::control::{
     ActionRequested, ActionResult, AgentAction, AiPipelineType, AiProfileProjection,
-    AiProfileSnapshot, AudioInputReady, CaptureQuality, ControlMessage, ConversationReady,
-    ConversationStopped, DurableAccepted, EndAudioInput, JobCompleted, JobRef, JobState, JobStatus,
-    ProfileCatalogSnapshot, ResultPersisted, StartConversation, StopConversation,
-    SubmitPostCallJob, TtsState, TtsStateChanged,
+    AiProfileSnapshot, AsrFinal, AssistConversationReady, AssistSuggestion, AudioInputReady,
+    CaptureQuality, ControlMessage, ConversationReady, ConversationStopped, DurableAccepted,
+    EndAudioInput, JobCompleted, JobRef, JobState, JobStatus, ProfileCatalogSnapshot,
+    ResultPersisted, StartAssistConversation, StartConversation, StopAssistConversation,
+    StopConversation, SubmitPostCallJob, TtsState, TtsStateChanged,
 };
 use ai_protocol::id::{ConversationId, JobId, ProfileId};
 use ai_protocol::media::{MediaFrame, MediaFrameMetadata};
@@ -23,6 +24,7 @@ use ai_provider::{
     TtsRequest,
 };
 use anyhow::{Context, Result, bail};
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -41,6 +43,9 @@ pub struct Gateway {
     events: broadcast::Sender<ControlMessage>,
     worker_instance_id: String,
     voice_sessions: Arc<Mutex<std::collections::BTreeMap<ConversationId, VoiceConversation>>>,
+    assist_sessions: Arc<Mutex<std::collections::BTreeMap<ConversationId, AssistConversation>>>,
+    assist_history: Arc<Mutex<BTreeMap<ConversationId, VecDeque<ControlMessage>>>>,
+    assist_execution: Arc<tokio::sync::Mutex<()>>,
     media_events: broadcast::Sender<MediaFrame>,
 }
 
@@ -72,12 +77,34 @@ struct VoiceTurn {
     output_sequence: u64,
 }
 
+struct AssistConversation {
+    conversation: JobRef,
+    profile: AiProfileSnapshot,
+    streams:
+        std::collections::BTreeMap<ai_protocol::id::StreamId, ai_protocol::control::StreamBinding>,
+    buffered_frames: Vec<MediaFrame>,
+    speech_frames: u16,
+    silent_frames: u16,
+    next_segment_id: u64,
+    recent_transcript: Vec<ai_protocol::control::TranscriptSegment>,
+}
+
+struct AssistTurn {
+    conversation: JobRef,
+    profile: AiProfileSnapshot,
+    stream: ai_protocol::control::StreamBinding,
+    frames: Vec<MediaFrame>,
+    segment_id: u64,
+}
+
 const VAD_MIN_SPEECH_FRAMES: u16 = 5;
 const VAD_END_SILENCE_FRAMES: u16 = 10;
 const BARGE_IN_MIN_SPEECH_FRAMES: u16 = 15;
 const BARGE_IN_MIN_ENERGY: u32 = 1_000;
 const VAD_MAX_SPEECH_FRAMES: usize = 250;
 const VAD_MAX_BUFFERED_FRAMES: usize = 1_500;
+const ASSIST_HISTORY_PER_CONVERSATION: usize = 128;
+const ASSIST_HISTORY_CONVERSATIONS: usize = 256;
 
 impl Gateway {
     pub fn open(
@@ -113,6 +140,9 @@ impl Gateway {
             events,
             worker_instance_id,
             voice_sessions: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            assist_sessions: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            assist_history: Arc::new(Mutex::new(BTreeMap::new())),
+            assist_execution: Arc::new(tokio::sync::Mutex::new(())),
             media_events,
         });
         tokio::spawn(Self::worker_dispatch(gateway.clone(), job_rx));
@@ -136,6 +166,22 @@ impl Gateway {
 
     pub fn subscribe(&self) -> broadcast::Receiver<ControlMessage> {
         self.events.subscribe()
+    }
+
+    /// Return the bounded replay window and a live receiver as one subscription operation.
+    /// Assist publishers hold the same history lock while broadcasting, so events are not
+    /// lost between the replay snapshot and the live stream.
+    pub fn subscribe_assist(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> (Vec<ControlMessage>, broadcast::Receiver<ControlMessage>) {
+        let history = self.assist_history.lock().unwrap();
+        let receiver = self.events.subscribe();
+        let replay = history
+            .get(conversation_id)
+            .map(|events| events.iter().cloned().collect())
+            .unwrap_or_default();
+        (replay, receiver)
     }
 
     /// TTS is sent only over the local media socket.  It is deliberately separate from the
@@ -223,6 +269,69 @@ impl Gateway {
             });
         }
         Ok(ready)
+    }
+
+    pub fn start_assist_conversation(
+        &self,
+        request: StartAssistConversation,
+    ) -> Result<AssistConversationReady> {
+        request.validate()?;
+        let mut sessions = self.assist_sessions.lock().unwrap();
+        sessions
+            .entry(request.conversation.conversation_id.clone())
+            .or_insert_with(|| AssistConversation {
+                conversation: request.conversation.clone(),
+                profile: request.profile.clone(),
+                streams: request
+                    .streams
+                    .iter()
+                    .cloned()
+                    .map(|stream| (stream.stream_id.clone(), stream))
+                    .collect(),
+                buffered_frames: Vec::new(),
+                speech_frames: 0,
+                silent_frames: 0,
+                next_segment_id: 1,
+                recent_transcript: Vec::new(),
+            });
+        self.assist_history
+            .lock()
+            .unwrap()
+            .entry(request.conversation.conversation_id.clone())
+            .or_default();
+        info!(conversation_id = %request.conversation.conversation_id, profile_id = %request.profile.profile_id, "realtime assist conversation started");
+        Ok(AssistConversationReady {
+            conversation: request.conversation,
+        })
+    }
+
+    pub fn stop_assist_conversation(&self, request: StopAssistConversation) -> Result<()> {
+        let pending = self
+            .assist_sessions
+            .lock()
+            .unwrap()
+            .remove(&request.conversation.conversation_id)
+            .and_then(|session| {
+                if session.speech_frames < VAD_MIN_SPEECH_FRAMES
+                    || session.buffered_frames.is_empty()
+                {
+                    return None;
+                }
+                let stream_id = session.buffered_frames.first()?.metadata.stream_id.clone();
+                let stream = session.streams.get(&stream_id)?.clone();
+                Some(AssistTurn {
+                    conversation: session.conversation,
+                    profile: session.profile,
+                    stream,
+                    frames: session.buffered_frames,
+                    segment_id: session.next_segment_id,
+                })
+            });
+        if let Some(turn) = pending {
+            self.spawn_assist_turn(turn);
+        }
+        info!(conversation_id = %request.conversation.conversation_id, reason = %request.reason, "realtime assist conversation stopped");
+        Ok(())
     }
 
     pub fn stop_conversation(&self, request: StopConversation) -> Result<ConversationStopped> {
@@ -326,6 +435,16 @@ impl Gateway {
                     capture_process_max_gap_ms: profile.capture.process_max_gap_ms,
                 };
                 let executable = match profile.pipeline_type {
+                    AiPipelineType::RealtimeAssist => {
+                        profile
+                            .asr_provider_id
+                            .as_deref()
+                            .is_some_and(|id| providers.asr(id).is_some())
+                            && profile
+                                .llm_provider_id
+                                .as_deref()
+                                .is_some_and(|id| providers.llm(id).is_some())
+                    }
                     AiPipelineType::PostCallAnalysis => {
                         profile
                             .asr_provider_id
@@ -481,7 +600,11 @@ impl Gateway {
         if let Some(turn) = turn {
             self.spawn_voice_turn(turn);
         }
-        if is_voice_conversation {
+        let (is_assist_conversation, assist_turn) = self.ingest_assist_media(&frame)?;
+        if let Some(turn) = assist_turn {
+            self.spawn_assist_turn(turn);
+        }
+        if is_voice_conversation || is_assist_conversation {
             return Ok(());
         }
         let _guard = self.ingest_lock.lock().unwrap();
@@ -499,6 +622,70 @@ impl Gateway {
             &stored.manifest,
             unix_timestamp_ms(),
         )
+    }
+
+    fn ingest_assist_media(&self, frame: &MediaFrame) -> Result<(bool, Option<AssistTurn>)> {
+        let mut sessions = self.assist_sessions.lock().unwrap();
+        let Some(session) = sessions.get_mut(&frame.metadata.conversation_id) else {
+            return Ok((false, None));
+        };
+        let Some(stream) = session.streams.get(&frame.metadata.stream_id).cloned() else {
+            return Ok((true, None));
+        };
+        if frame.metadata.job_id != session.conversation.job_id
+            || frame.metadata.tenant_id != session.conversation.tenant_id
+            || frame.metadata.generation != session.conversation.generation
+            || frame.metadata.participant_id != stream.participant_id
+            || frame.metadata.direction != ai_protocol::control::MediaDirection::FromParticipant
+        {
+            bail!("assist media identity mismatch");
+        }
+        if frame_has_voice(frame) {
+            session.speech_frames = session.speech_frames.saturating_add(1);
+            session.silent_frames = 0;
+        } else if session.speech_frames > 0 {
+            session.silent_frames = session.silent_frames.saturating_add(1);
+        }
+        if session.speech_frames > 0 {
+            session.buffered_frames.push(frame.clone());
+        }
+        let max_reached = session.buffered_frames.len() >= VAD_MAX_SPEECH_FRAMES;
+        if session.speech_frames < VAD_MIN_SPEECH_FRAMES
+            || (!max_reached && session.silent_frames < VAD_END_SILENCE_FRAMES)
+        {
+            return Ok((true, None));
+        }
+        let frames = std::mem::take(&mut session.buffered_frames);
+        session.speech_frames = 0;
+        session.silent_frames = 0;
+        let segment_id = session.next_segment_id;
+        session.next_segment_id = segment_id.saturating_add(1);
+        Ok((
+            true,
+            Some(AssistTurn {
+                conversation: session.conversation.clone(),
+                profile: session.profile.clone(),
+                stream,
+                frames,
+                segment_id,
+            }),
+        ))
+    }
+
+    fn spawn_assist_turn(&self, turn: AssistTurn) {
+        let providers = self.providers.read().unwrap().clone();
+        let events = self.events.clone();
+        let sessions = self.assist_sessions.clone();
+        let history = self.assist_history.clone();
+        let execution = self.assist_execution.clone();
+        tokio::spawn(async move {
+            let _guard = execution.lock().await;
+            if let Err(error) =
+                execute_assist_turn(turn, providers, events, history, sessions).await
+            {
+                warn!(error = %error, "assist turn failed");
+            }
+        });
     }
 
     fn ingest_voice_media(&self, frame: &MediaFrame) -> Result<(bool, Option<VoiceTurn>)> {
@@ -1366,6 +1553,171 @@ async fn execute_voice_turn(
     Ok(())
 }
 
+async fn execute_assist_turn(
+    turn: AssistTurn,
+    providers: Arc<ProviderRegistry>,
+    events: broadcast::Sender<ControlMessage>,
+    history: Arc<Mutex<BTreeMap<ConversationId, VecDeque<ControlMessage>>>>,
+    sessions: Arc<Mutex<std::collections::BTreeMap<ConversationId, AssistConversation>>>,
+) -> Result<()> {
+    let asr_id = turn
+        .profile
+        .asr_provider_id
+        .as_deref()
+        .context("assist ASR provider missing")?;
+    let llm_id = turn
+        .profile
+        .llm_provider_id
+        .as_deref()
+        .context("assist LLM provider missing")?;
+    let asr = providers
+        .asr(asr_id)
+        .context("assist ASR provider unavailable")?;
+    let llm = providers
+        .llm(llm_id)
+        .context("assist LLM provider unavailable")?;
+    let duration_ms = turn
+        .frames
+        .iter()
+        .map(|frame| u64::from(frame.metadata.duration_ms))
+        .sum();
+    let payload = turn
+        .frames
+        .iter()
+        .flat_map(|frame| frame.payload.iter().copied())
+        .collect();
+    let output = asr
+        .transcribe(AsrRequest {
+            operation_id: format!(
+                "{}-assist-asr-{}",
+                turn.conversation.operation_id, turn.segment_id
+            ),
+            language: None,
+            streams: vec![AsrAudioInput {
+                stream_id: turn.stream.stream_id.clone(),
+                participant_id: turn.stream.participant_id.clone(),
+                duration_ms,
+                codec: turn.stream.codec,
+                sample_rate: turn.stream.sample_rate,
+                channels: turn.stream.channels,
+                payload,
+            }],
+        })
+        .await
+        .map_err(anyhow::Error::from)?;
+    info!(conversation_id = %turn.conversation.conversation_id, segment_id = turn.segment_id, segments = output.segments.len(), "realtime assist ASR completed");
+    let mut final_segments = output.segments;
+    if final_segments.is_empty() {
+        return Ok(());
+    }
+    for segment in &mut final_segments {
+        segment.final_segment = true;
+    }
+    let first = final_segments
+        .first()
+        .cloned()
+        .context("missing ASR segment")?;
+    publish_assist_event(
+        &events,
+        &history,
+        ControlMessage::AsrPartial(ai_protocol::control::AsrPartial {
+            conversation: turn.conversation.clone(),
+            participant_id: first.participant_id.clone(),
+            segment_id: turn.segment_id,
+            text: first.text.clone(),
+            start_ms: first.start_ms,
+            end_ms: first.end_ms,
+        }),
+    );
+    {
+        let mut guard = sessions.lock().unwrap();
+        if let Some(session) = guard.get_mut(&turn.conversation.conversation_id)
+            && session.conversation == turn.conversation
+        {
+            session.recent_transcript.extend(final_segments.clone());
+            if session.recent_transcript.len() > 20 {
+                let drop = session.recent_transcript.len() - 20;
+                session.recent_transcript.drain(0..drop);
+            }
+        }
+    }
+    publish_assist_event(
+        &events,
+        &history,
+        ControlMessage::AsrFinal(AsrFinal {
+            conversation: turn.conversation.clone(),
+            participant_id: first.participant_id.clone(),
+            segment_id: turn.segment_id,
+            text: first.text.clone(),
+            start_ms: first.start_ms,
+            end_ms: first.end_ms,
+        }),
+    );
+    let transcript = sessions
+        .lock()
+        .unwrap()
+        .get(&turn.conversation.conversation_id)
+        .filter(|session| session.conversation == turn.conversation)
+        .map(|session| session.recent_transcript.clone())
+        .unwrap_or_else(|| final_segments.clone());
+    let suggestion = llm
+        .summarize(LlmRequest {
+            operation_id: format!(
+                "{}-assist-llm-{}",
+                turn.conversation.operation_id, turn.segment_id
+            ),
+            transcript,
+            allow_actions: false,
+        })
+        .await
+        .map_err(anyhow::Error::from)?;
+    info!(conversation_id = %turn.conversation.conversation_id, segment_id = turn.segment_id, "realtime assist LLM completed");
+    let text = if suggestion.result.summary.trim().is_empty() {
+        first.text
+    } else {
+        suggestion.result.summary
+    };
+    publish_assist_event(
+        &events,
+        &history,
+        ControlMessage::AssistSuggestion(AssistSuggestion {
+            conversation: turn.conversation,
+            suggestion_id: turn.segment_id,
+            kind: "next_step".to_string(),
+            text,
+            confidence: None,
+            source_segment_id: turn.segment_id,
+        }),
+    );
+    Ok(())
+}
+
+fn publish_assist_event(
+    events: &broadcast::Sender<ControlMessage>,
+    history: &Arc<Mutex<BTreeMap<ConversationId, VecDeque<ControlMessage>>>>,
+    message: ControlMessage,
+) {
+    let conversation_id = match &message {
+        ControlMessage::AsrPartial(event) => event.conversation.conversation_id.clone(),
+        ControlMessage::AsrFinal(event) => event.conversation.conversation_id.clone(),
+        ControlMessage::AssistSuggestion(event) => event.conversation.conversation_id.clone(),
+        _ => return,
+    };
+    let mut histories = history.lock().unwrap();
+    if histories.len() >= ASSIST_HISTORY_CONVERSATIONS
+        && !histories.contains_key(&conversation_id)
+        && let Some(oldest) = histories.keys().next().cloned()
+    {
+        histories.remove(&oldest);
+    }
+    let entries = histories.entry(conversation_id).or_default();
+    if entries.len() >= ASSIST_HISTORY_PER_CONVERSATION {
+        entries.pop_front();
+    }
+    entries.push_back(message.clone());
+    let _ = events.send(message);
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_welcome(
     welcome: WelcomePrompt,
@@ -1582,8 +1934,16 @@ fn hours_ms(hours: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{BARGE_IN_MIN_ENERGY, alaw_to_pcm, mean_abs_for_codec, ulaw_to_pcm};
-    use ai_protocol::control::AudioCodec;
+    use super::{
+        ASSIST_HISTORY_PER_CONVERSATION, BARGE_IN_MIN_ENERGY, alaw_to_pcm, mean_abs_for_codec,
+        publish_assist_event, ulaw_to_pcm,
+    };
+    use ai_protocol::control::JobRef;
+    use ai_protocol::control::{AsrPartial, AudioCodec, ControlMessage};
+    use ai_protocol::id::{ConversationId, JobId, OperationId, ParticipantId, TenantId};
+    use std::collections::{BTreeMap, VecDeque};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::broadcast;
 
     #[test]
     fn vad_rejects_g711_silence_and_accepts_speech_energy() {
@@ -1603,5 +1963,43 @@ mod tests {
     fn barge_in_requires_stronger_energy_than_vad() {
         assert!(mean_abs_for_codec(AudioCodec::Pcma, &[0x80; 160]) >= BARGE_IN_MIN_ENERGY);
         assert!(mean_abs_for_codec(AudioCodec::Pcma, &[0xd5; 160]) < BARGE_IN_MIN_ENERGY);
+    }
+
+    #[test]
+    fn assist_events_are_replayed_and_bounded() {
+        let conversation_id = ConversationId::new("call-1").unwrap();
+        let job = JobRef {
+            job_id: JobId::new("job-1").unwrap(),
+            tenant_id: TenantId::new("tenant-1").unwrap(),
+            conversation_id: conversation_id.clone(),
+            operation_id: OperationId::new("assist").unwrap(),
+            generation: 1,
+        };
+        let participant_id = ParticipantId::new("caller").unwrap();
+        let (events, _) = broadcast::channel(8);
+        let history = Arc::new(Mutex::new(BTreeMap::<
+            ConversationId,
+            VecDeque<ControlMessage>,
+        >::new()));
+        for segment_id in 1..=(ASSIST_HISTORY_PER_CONVERSATION as u64 + 1) {
+            publish_assist_event(
+                &events,
+                &history,
+                ControlMessage::AsrPartial(AsrPartial {
+                    conversation: job.clone(),
+                    participant_id: participant_id.clone(),
+                    segment_id,
+                    text: segment_id.to_string(),
+                    start_ms: 0,
+                    end_ms: 20,
+                }),
+            );
+        }
+        let replay = history.lock().unwrap()[&conversation_id].clone();
+        assert_eq!(replay.len(), ASSIST_HISTORY_PER_CONVERSATION);
+        let ControlMessage::AsrPartial(first) = &replay[0] else {
+            panic!("partial expected")
+        };
+        assert_eq!(first.segment_id, 2);
     }
 }

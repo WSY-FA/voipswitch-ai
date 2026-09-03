@@ -5,6 +5,7 @@ let catalog = null;
 let providerTypes = [];
 let locale = "zh-CN";
 let messages = {};
+let assistSource = null;
 
 function escapeHtml(value) {
   return String(value ?? "-").replace(/[&<>'"]/g, (char) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", "'":"&#39;", '"':"&quot;" }[char]));
@@ -81,6 +82,7 @@ function providerReady(id, expected) {
 function profileRequirements(pipelineType) {
   return {
     transcription: ["asr"],
+    realtime_assist: ["asr", "llm"],
     post_call_analysis: ["asr", "llm"],
     llm_task: ["llm"],
     voice_agent: ["asr", "llm", "tts"],
@@ -143,11 +145,53 @@ function renderProviderRows(capabilityName, selector) {
 }
 
 function pipelineKey(type) {
-  return ({ transcription: "transcription", post_call_analysis: "postCallAnalysis", llm_task: "llmTask", voice_agent: "voiceAgent" })[type] || type;
+  return ({ transcription: "transcription", realtime_assist: "realtimeAssist", post_call_analysis: "postCallAnalysis", llm_task: "llmTask", voice_agent: "voiceAgent" })[type] || type;
 }
 
 function updateGatewayStatus() {
   if (catalog) $("#gatewayStatus").textContent = t("status.connected", { version: catalog.version });
+}
+
+function closeAssistStream() {
+  if (assistSource) assistSource.close();
+  assistSource = null;
+  $("#assistConnect").disabled = false;
+  $("#assistDisconnect").disabled = true;
+  $("#assistStatus").textContent = t("assist.disconnected");
+}
+
+function appendAssistEvent(eventName, payload) {
+  const rows = $("#assistEvents");
+  if (rows.children.length === 1 && rows.firstElementChild.querySelector("[data-i18n]")) rows.replaceChildren();
+  const text = payload.text || payload.result?.summary || JSON.stringify(payload);
+  const row = document.createElement("tr");
+  row.innerHTML = `<td>${escapeHtml(new Date().toLocaleTimeString())}</td><td>${escapeHtml(eventName)}</td><td>${escapeHtml(text)}</td>`;
+  rows.prepend(row);
+  while (rows.children.length > 200) rows.lastElementChild.remove();
+}
+
+function connectAssistStream() {
+  const conversationId = $("#assistConversationId").value.trim();
+  if (!conversationId) {
+    $("#assistStatus").textContent = t("assist.invalidConversation");
+    return;
+  }
+  closeAssistStream();
+  $("#assistEvents").innerHTML = "";
+  assistSource = new EventSource(`/api/assist/events/${encodeURIComponent(conversationId)}`);
+  ["asr_partial", "asr_final", "suggestion"].forEach((eventName) => {
+    assistSource.addEventListener(eventName, (event) => {
+      try { appendAssistEvent(eventName, JSON.parse(event.data)); } catch (_) { /* ignore malformed event */ }
+    });
+  });
+  assistSource.onopen = () => {
+    $("#assistStatus").textContent = t("assist.connected", { id: conversationId });
+    $("#assistConnect").disabled = true;
+    $("#assistDisconnect").disabled = false;
+  };
+  assistSource.onerror = () => {
+    $("#assistStatus").textContent = t("assist.reconnecting");
+  };
 }
 
 async function loadCatalog() {
@@ -422,6 +466,8 @@ function initialize() {
   $("#languageSelect").addEventListener("change", changeLanguage);
   $("#languageSelectApp").addEventListener("change", changeLanguage);
   $("#refresh").addEventListener("click", showCatalogOrReportError);
+  $("#assistConnect").addEventListener("click", connectAssistStream);
+  $("#assistDisconnect").addEventListener("click", closeAssistStream);
   $("#logout").addEventListener("click", async () => { await api("/api/auth/logout", { method:"POST" }); window.location.reload(); });
   document.querySelectorAll(".nav-link").forEach((link) => link.addEventListener("click", (event) => { event.preventDefault(); document.querySelectorAll(".nav-link").forEach((item) => item.classList.remove("active")); link.classList.add("active"); document.querySelectorAll(".view").forEach((view) => { const active = `#${view.id}` === link.getAttribute("href"); view.hidden = !active; view.classList.toggle("active", active); }); $("#pageTitle").textContent = t(link.dataset.i18n); }));
   loadLanguage(preferredLanguage()).then(() => {

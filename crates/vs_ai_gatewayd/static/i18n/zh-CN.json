@@ -94,6 +94,7 @@
   "form.type": "类型",
   "provider.typeUnavailable": "该服务商类型尚未加载适配器",
   "pipeline.transcription": "仅转写",
+  "pipeline.realtimeAssist": "实时坐席辅助",
   "pipeline.postCallAnalysis": "通话后分析",
   "pipeline.llmTask": "纯文本 LLM 任务",
   "pipeline.voiceAgent": "AI 语音机器人",
@@ -134,5 +135,18 @@
   "errors.AI_ADMIN_REJECTED": "AI 网关拒绝了这项配置。",
   "errors.AI_GATEWAY_UNAVAILABLE": "AI 网关当前不可用。",
   "actions.close": "关闭",
-  "errors.unknown": "操作失败，请稍后重试。"
+  "errors.unknown": "操作失败，请稍后重试。",
+  "nav.assist": "实时辅助",
+  "assist.title": "实时坐席辅助",
+  "assist.conversationId": "Conversation ID",
+  "assist.connect": "连接",
+  "assist.disconnect": "断开",
+  "assist.disconnected": "未连接",
+  "assist.connected": "已连接：{id}",
+  "assist.reconnecting": "连接中断，正在重连",
+  "assist.invalidConversation": "请输入有效的会话 ID",
+  "assist.eventTime": "时间",
+  "assist.eventType": "事件",
+  "assist.eventText": "内容",
+  "assist.empty": "连接后显示实时转写和建议"
 }

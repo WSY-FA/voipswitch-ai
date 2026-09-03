@@ -167,6 +167,18 @@ async fn handle_control_client(
                             &envelope(ControlMessage::ActionRequested(action), &sequence)?,
                         ).await?;
                     }
+                Ok(ControlMessage::AsrFinal(event))
+                    if owned_conversations.contains(&event.conversation.conversation_id) => {
+                        write_json_frame(&mut writer, &envelope(ControlMessage::AsrFinal(event), &sequence)?).await?;
+                    }
+                Ok(ControlMessage::AsrPartial(event))
+                    if owned_conversations.contains(&event.conversation.conversation_id) => {
+                        write_json_frame(&mut writer, &envelope(ControlMessage::AsrPartial(event), &sequence)?).await?;
+                    }
+                Ok(ControlMessage::AssistSuggestion(event))
+                    if owned_conversations.contains(&event.conversation.conversation_id) => {
+                        write_json_frame(&mut writer, &envelope(ControlMessage::AssistSuggestion(event), &sequence)?).await?;
+                    }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(count)) => {
                     warn!(count, "AI control client event queue lagged; client must query job result");
@@ -198,6 +210,7 @@ fn dispatch(
                 "audio_input".to_string(),
                 "post_call_job".to_string(),
                 "voice_agent".to_string(),
+                "realtime_assist".to_string(),
                 "durable_result".to_string(),
                 "profile_catalog".to_string(),
             ],
@@ -253,6 +266,12 @@ fn dispatch(
                 gateway.start_conversation(request)?,
             )])
         }
+        ControlMessage::StartAssistConversation(request) => {
+            owned_conversations.insert(request.conversation.conversation_id.clone());
+            Ok(vec![ControlMessage::AssistConversationReady(
+                gateway.start_assist_conversation(request)?,
+            )])
+        }
         ControlMessage::SynthesizeTts(_) => {
             bail!("TTS synthesis requires an established connector")
         }
@@ -261,6 +280,11 @@ fn dispatch(
             Ok(vec![ControlMessage::ConversationStopped(
                 gateway.stop_conversation(request)?,
             )])
+        }
+        ControlMessage::StopAssistConversation(request) => {
+            owned_conversations.remove(&request.conversation.conversation_id);
+            gateway.stop_assist_conversation(request)?;
+            Ok(Vec::new())
         }
         ControlMessage::ActionResult(result) => {
             owned_conversations.insert(result.conversation.conversation_id.clone());

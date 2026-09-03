@@ -1059,6 +1059,7 @@ fn optional_provider_id(value: String) -> Option<String> {
 fn pipeline_type_str(value: AiPipelineType) -> &'static str {
     match value {
         AiPipelineType::Transcription => "transcription",
+        AiPipelineType::RealtimeAssist => "realtime_assist",
         AiPipelineType::PostCallAnalysis => "post_call_analysis",
         AiPipelineType::LlmTask => "llm_task",
         AiPipelineType::VoiceAgent => "voice_agent",

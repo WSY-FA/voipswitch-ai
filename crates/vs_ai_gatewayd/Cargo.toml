@@ -10,6 +10,7 @@ ai-provider = { path = "../ai-provider" }
 anyhow.workspace = true
 argon2.workspace = true
 axum.workspace = true
+futures-util.workspace = true
 chrono.workspace = true
 clap.workspace = true
 rand.workspace = true

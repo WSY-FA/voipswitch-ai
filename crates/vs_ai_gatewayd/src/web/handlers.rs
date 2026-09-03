@@ -5,11 +5,14 @@ use ai_gateway::{
 };
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, put};
 use axum::{Json, Router};
+use futures_util::stream;
 use serde::Deserialize;
 use serde_json::json;
+use std::convert::Infallible;
 use std::sync::Arc;
 use tracing::warn;
 
@@ -41,6 +44,82 @@ pub fn router() -> Router<SharedState> {
             "/api/profiles/:profile_id",
             put(update_profile).delete(delete_profile),
         )
+        .route("/api/assist/events/:conversation_id", get(assist_events))
+}
+
+async fn assist_events(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    axum::extract::Path(conversation_id): axum::extract::Path<String>,
+) -> Response {
+    if authenticated(&state, &headers).is_none() {
+        return auth_required();
+    }
+    let conversation = match ai_protocol::id::ConversationId::new(&conversation_id) {
+        Ok(value) => value,
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_CONVERSATION_ID",
+                "invalid conversation id",
+            );
+        }
+    };
+    let (replay, receiver) = state.gateway.subscribe_assist(&conversation);
+    let stream = stream::unfold(
+        (replay.into_iter(), receiver),
+        move |(mut replay, mut receiver)| {
+            let conversation_id = conversation_id.clone();
+            async move {
+                loop {
+                    if let Some(message) = replay.next() {
+                        if let Some(event) = assist_sse_event(&message, &conversation_id) {
+                            return Some((Ok::<Event, Infallible>(event), (replay, receiver)));
+                        }
+                        continue;
+                    }
+                    match receiver.recv().await {
+                        Ok(message) => {
+                            if let Some(event) = assist_sse_event(&message, &conversation_id) {
+                                return Some((Ok::<Event, Infallible>(event), (replay, receiver)));
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                    }
+                }
+            }
+        },
+    );
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+fn assist_sse_event(
+    message: &ai_protocol::control::ControlMessage,
+    conversation_id: &str,
+) -> Option<Event> {
+    let event_name = match message {
+        ai_protocol::control::ControlMessage::AsrPartial(event)
+            if event.conversation.conversation_id.as_str() == conversation_id =>
+        {
+            "asr_partial"
+        }
+        ai_protocol::control::ControlMessage::AsrFinal(event)
+            if event.conversation.conversation_id.as_str() == conversation_id =>
+        {
+            "asr_final"
+        }
+        ai_protocol::control::ControlMessage::AssistSuggestion(event)
+            if event.conversation.conversation_id.as_str() == conversation_id =>
+        {
+            "suggestion"
+        }
+        _ => return None,
+    };
+    let data = serde_json::to_string(message).unwrap_or_else(|_| "{}".to_string());
+    Some(Event::default().event(event_name).data(data))
 }
 
 async fn index() -> impl IntoResponse {

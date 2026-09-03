@@ -47,6 +47,12 @@ pub enum ControlMessage {
     JobStatus(JobStatus),
     JobResultRequest(JobResultRequest),
     StartConversation(StartConversation),
+    StartAssistConversation(StartAssistConversation),
+    AssistConversationReady(AssistConversationReady),
+    StopAssistConversation(StopAssistConversation),
+    AsrPartial(AsrPartial),
+    AsrFinal(AsrFinal),
+    AssistSuggestion(AssistSuggestion),
     ConversationReady(ConversationReady),
     StopConversation(StopConversation),
     ConversationStopped(ConversationStopped),
@@ -86,6 +92,83 @@ pub struct StartConversation {
     pub input_stream: StreamBinding,
     #[serde(default)]
     pub welcome: Option<WelcomePrompt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StartAssistConversation {
+    pub conversation: JobRef,
+    pub profile: AiProfileSnapshot,
+    pub participants: Vec<Participant>,
+    pub streams: Vec<StreamBinding>,
+}
+
+impl StartAssistConversation {
+    pub fn validate(&self) -> Result<()> {
+        self.profile.validate()?;
+        if self.profile.pipeline_type != AiPipelineType::RealtimeAssist {
+            bail!("assist conversation requires a realtime_assist profile");
+        }
+        if self.conversation.generation == 0
+            || self.participants.is_empty()
+            || self.streams.is_empty()
+        {
+            bail!("assist conversation requires generation, participants and streams");
+        }
+        for stream in &self.streams {
+            if !self
+                .participants
+                .iter()
+                .any(|p| p.participant_id == stream.participant_id)
+            {
+                bail!("assist stream references unknown participant");
+            }
+            if stream.direction != MediaDirection::FromParticipant {
+                bail!("assist stream must be from participant");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssistConversationReady {
+    pub conversation: JobRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopAssistConversation {
+    pub conversation: JobRef,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AsrPartial {
+    pub conversation: JobRef,
+    pub participant_id: ParticipantId,
+    pub segment_id: u64,
+    pub text: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AsrFinal {
+    pub conversation: JobRef,
+    pub participant_id: ParticipantId,
+    pub segment_id: u64,
+    pub text: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssistSuggestion {
+    pub conversation: JobRef,
+    pub suggestion_id: u64,
+    pub kind: String,
+    pub text: String,
+    pub confidence: Option<f32>,
+    pub source_segment_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,6 +292,7 @@ impl ControlMessage {
             Self::SubmitPostCallJob(request) => request.validate(),
             Self::ProfileCatalogSnapshot(snapshot) => snapshot.validate(),
             Self::StartConversation(request) => request.validate(),
+            Self::StartAssistConversation(request) => request.validate(),
             Self::ActionRequested(request) => request.validate(),
             Self::SynthesizeTts(request) => {
                 if request.request_id.trim().is_empty() || request.request_id.len() > 128 {
@@ -365,6 +449,7 @@ impl SubmitPostCallJob {
 #[serde(rename_all = "snake_case")]
 pub enum AiPipelineType {
     Transcription,
+    RealtimeAssist,
     #[default]
     PostCallAnalysis,
     LlmTask,
@@ -375,14 +460,14 @@ impl AiPipelineType {
     pub fn requires_asr(self) -> bool {
         matches!(
             self,
-            Self::Transcription | Self::PostCallAnalysis | Self::VoiceAgent
+            Self::Transcription | Self::RealtimeAssist | Self::PostCallAnalysis | Self::VoiceAgent
         )
     }
 
     pub fn requires_llm(self) -> bool {
         matches!(
             self,
-            Self::PostCallAnalysis | Self::LlmTask | Self::VoiceAgent
+            Self::RealtimeAssist | Self::PostCallAnalysis | Self::LlmTask | Self::VoiceAgent
         )
     }
 
@@ -738,6 +823,52 @@ mod tests {
             }
             .validate()
             .is_err()
+        );
+    }
+
+    #[test]
+    fn validates_realtime_assist_profile_and_streams() {
+        let profile = AiProfileSnapshot {
+            profile_id: id("assist-profile"),
+            profile_version: 1,
+            pipeline_type: AiPipelineType::RealtimeAssist,
+            asr_provider_id: Some("asr".to_string()),
+            llm_provider_id: Some("llm".to_string()),
+            tts_provider_id: None,
+            capture_complete_ratio: 0.995,
+            capture_process_min_ratio: 0.95,
+            capture_complete_max_gap_ms: 200,
+            capture_process_max_gap_ms: 5_000,
+        };
+        let conversation = JobRef {
+            job_id: id("job"),
+            tenant_id: id("tenant"),
+            conversation_id: id("conversation"),
+            operation_id: id("operation"),
+            generation: 1,
+        };
+        let participant = Participant {
+            participant_id: id("caller"),
+            role: "caller".into(),
+            display_number: None,
+        };
+        let stream = StreamBinding {
+            stream_id: id("audio"),
+            participant_id: participant.participant_id.clone(),
+            direction: MediaDirection::FromParticipant,
+            codec: AudioCodec::Pcma,
+            sample_rate: 8_000,
+            channels: 1,
+        };
+        assert!(
+            StartAssistConversation {
+                conversation,
+                profile,
+                participants: vec![participant],
+                streams: vec![stream]
+            }
+            .validate()
+            .is_ok()
         );
     }
 }
