@@ -54,7 +54,7 @@ impl LlmProvider for OpenAiCompatibleLlmProvider {
                    "end_ms": segment.end_ms, "text": segment.text})
         }).collect::<Vec<_>>();
         let action_instruction = if request.allow_actions {
-            " Include an optional action object using only play_text, collect_digits, transfer_to_extension, transfer_to_business_target, or end_call; use null when no action is needed."
+            " Include an optional action object using only play_text, collect_digits, transfer_to_extension, transfer_to_business_target, or end_call; use null when no action is needed. For transfer_to_extension, number must be a JSON string containing only digits, for example {\"type\":\"transfer_to_extension\",\"number\":\"1002\"}."
         } else {
             " Set action to null."
         };
@@ -157,11 +157,18 @@ fn parse_structured_call_result(content: &str) -> ProviderResult<StructuredCallR
         key_points: strings("key_points"),
         action_items: strings("action_items"),
         tags: strings("tags"),
-        action: object
-            .get("action")
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok()),
+        action: object.get("action").cloned().and_then(parse_agent_action),
     })
+}
+
+fn parse_agent_action(mut value: Value) -> Option<ai_protocol::control::AgentAction> {
+    if value.get("type").and_then(Value::as_str) == Some("transfer_to_extension")
+        && let Some(number) = value.get("number").and_then(Value::as_u64)
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("number".to_string(), Value::String(number.to_string()));
+    }
+    serde_json::from_value(value).ok()
 }
 
 fn json_value_as_string(value: &Value) -> String {
@@ -169,6 +176,24 @@ fn json_value_as_string(value: &Value) -> String {
         .as_str()
         .map(str::to_string)
         .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default())
+}
+
+#[cfg(test)]
+mod structured_result_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_numeric_extension_number_from_compatible_llm() {
+        let result = parse_structured_call_result(
+            r#"{"schema_version":1,"summary":"转接中","purpose":"转接","outcome":"已请求","key_points":[],"action_items":[],"tags":[],"action":{"type":"transfer_to_extension","number":1002}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            result.action,
+            Some(ai_protocol::control::AgentAction::TransferToExtension { ref number })
+                if number == "1002"
+        ));
+    }
 }
 
 pub struct LocalHttpAsrProvider {
