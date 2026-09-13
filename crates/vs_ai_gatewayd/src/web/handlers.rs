@@ -168,12 +168,24 @@ async fn create_ai_ops_task(
             "invalid AI-04 task payload",
         );
     }
-    state
-        .ai_ops_tasks
-        .lock()
-        .expect("tasks lock")
-        .insert(task_id.to_owned(), payload.clone());
-    (StatusCode::CREATED, Json(json!({"ok":true,"task":payload}))).into_response()
+    let mut tasks = state.ai_ops_tasks.lock().expect("tasks lock");
+    if tasks.contains_key(task_id) {
+        return api_error(
+            StatusCode::CONFLICT,
+            "IDEMPOTENCY_CONFLICT",
+            "task already exists",
+        );
+    }
+    let mut task = payload.clone();
+    if let Some(object) = task.as_object_mut() {
+        object.entry("status").or_insert_with(|| json!("queued"));
+        object.insert(
+            "created_at_ms".into(),
+            json!(ai_protocol::time::unix_timestamp_ms()),
+        );
+    }
+    tasks.insert(task_id.to_owned(), task.clone());
+    (StatusCode::CREATED, Json(json!({"ok":true,"task":task}))).into_response()
 }
 
 async fn assist_events(
