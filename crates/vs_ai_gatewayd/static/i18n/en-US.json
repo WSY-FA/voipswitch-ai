@@ -148,5 +148,9 @@
   "assist.eventTime": "Time",
   "assist.eventType": "Event",
   "assist.eventText": "Content",
-  "assist.empty": "Live transcripts and suggestions appear after connecting"
+  "assist.empty": "Live transcripts and suggestions appear after connecting",
+  "nav.aiOps": "AI Operations",
+  "aiOps.title": "AI Operations Tasks",
+  "aiOps.empty": "No operations tasks",
+  "aiOps.cancel": "Cancel task"
 }

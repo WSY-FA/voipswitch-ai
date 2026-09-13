@@ -3,6 +3,7 @@ use crate::web::auth::{cookie_value, expired_session_cookie, session_cookie};
 use ai_gateway::{
     GatewayCatalog, GatewayProfileConfig, GatewayProviderKind, ProviderUpsertRequest,
 };
+use axum::extract::Path;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -45,6 +46,134 @@ pub fn router() -> Router<SharedState> {
             put(update_profile).delete(delete_profile),
         )
         .route("/api/assist/events/:conversation_id", get(assist_events))
+        .route(
+            "/api/ai-ops/tasks",
+            get(ai_ops_tasks).post(create_ai_ops_task),
+        )
+        .route("/api/ai-ops/tasks/:task_id", get(get_ai_ops_task))
+        .route(
+            "/api/ai-ops/tasks/:task_id/cancel",
+            axum::routing::post(cancel_ai_ops_task),
+        )
+}
+
+async fn ai_ops_tasks(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<std::collections::BTreeMap<String, String>>,
+) -> Response {
+    if authenticated(&state, &headers).is_none() {
+        return auth_required();
+    }
+    let tasks = state
+        .ai_ops_tasks
+        .lock()
+        .expect("tasks lock")
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let page = query
+        .get("page")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let page_size = query
+        .get("page_size")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(20)
+        .clamp(1, 100);
+    let start = (page - 1).saturating_mul(page_size);
+    let total = tasks.len();
+    let tasks = tasks
+        .into_iter()
+        .skip(start)
+        .take(page_size)
+        .collect::<Vec<_>>();
+    Json(json!({"ok":true,"tasks":tasks,"page":page,"page_size":page_size,"total":total}))
+        .into_response()
+}
+
+async fn cancel_ai_ops_task(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+) -> Response {
+    if authenticated(&state, &headers).is_none() {
+        return auth_required();
+    }
+    let mut tasks = state.ai_ops_tasks.lock().expect("tasks lock");
+    let Some(task) = tasks.get_mut(&task_id) else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "RESOURCE_NOT_FOUND",
+            "task not found",
+        );
+    };
+    if let Some(object) = task.as_object_mut() {
+        object.insert("status".into(), json!("cancelled"));
+        object.insert(
+            "cancelled_at_ms".into(),
+            json!(ai_protocol::time::unix_timestamp_ms()),
+        );
+    }
+    Json(json!({"ok":true,"task":task})).into_response()
+}
+
+async fn get_ai_ops_task(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+) -> Response {
+    if authenticated(&state, &headers).is_none() {
+        return auth_required();
+    }
+    match state
+        .ai_ops_tasks
+        .lock()
+        .expect("tasks lock")
+        .get(&task_id)
+        .cloned()
+    {
+        Some(task) => Json(json!({"ok":true,"task":task})).into_response(),
+        None => api_error(
+            StatusCode::NOT_FOUND,
+            "RESOURCE_NOT_FOUND",
+            "task not found",
+        ),
+    }
+}
+
+async fn create_ai_ops_task(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    if authenticated(&state, &headers).is_none() {
+        return auth_required();
+    }
+    let Some(task_id) = payload.get("task_id").and_then(|v| v.as_str()) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_ARGUMENT",
+            "task_id required",
+        );
+    };
+    if task_id.len() > 128
+        || payload.get("request_id").and_then(|v| v.as_str()).is_none()
+        || payload.get("task_kind").and_then(|v| v.as_str()) != Some("ops_diagnosis")
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_ARGUMENT",
+            "invalid AI-04 task payload",
+        );
+    }
+    state
+        .ai_ops_tasks
+        .lock()
+        .expect("tasks lock")
+        .insert(task_id.to_owned(), payload.clone());
+    (StatusCode::CREATED, Json(json!({"ok":true,"task":payload}))).into_response()
 }
 
 async fn assist_events(

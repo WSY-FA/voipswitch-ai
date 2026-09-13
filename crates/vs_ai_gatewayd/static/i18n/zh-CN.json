@@ -148,5 +148,9 @@
   "assist.eventTime": "时间",
   "assist.eventType": "事件",
   "assist.eventText": "内容",
-  "assist.empty": "连接后显示实时转写和建议"
+  "assist.empty": "连接后显示实时转写和建议",
+  "nav.aiOps": "AI 运维分析",
+  "aiOps.title": "AI 运维任务",
+  "aiOps.empty": "暂无运维任务",
+  "aiOps.cancel": "取消任务"
 }

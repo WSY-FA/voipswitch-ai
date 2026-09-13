@@ -37,6 +37,9 @@ pub enum ControlMessage {
     ProfileCatalogRequest(ProfileCatalogRequest),
     ProfileCatalogSnapshot(ProfileCatalogSnapshot),
     SubmitPostCallJob(SubmitPostCallJob),
+    SubmitLlmTask(SubmitLlmTask),
+    LlmTaskCompleted(LlmTaskCompleted),
+    CancelLlmTask(CancelLlmTask),
     DurableAccepted(DurableAccepted),
     AudioInputReady(AudioInputReady),
     EndAudioInput(EndAudioInput),
@@ -290,6 +293,9 @@ impl ControlMessage {
     fn validate(&self) -> Result<()> {
         match self {
             Self::SubmitPostCallJob(request) => request.validate(),
+            Self::SubmitLlmTask(request) => request.validate(),
+            Self::LlmTaskCompleted(result) => result.validate(),
+            Self::CancelLlmTask(request) => request.validate(),
             Self::ProfileCatalogSnapshot(snapshot) => snapshot.validate(),
             Self::StartConversation(request) => request.validate(),
             Self::StartAssistConversation(request) => request.validate(),
@@ -418,6 +424,89 @@ pub struct SubmitPostCallJob {
     pub profile: AiProfileSnapshot,
     pub participants: Vec<Participant>,
     pub streams: Vec<StreamBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubmitLlmTask {
+    pub task_id: String,
+    pub request_id: String,
+    pub task_kind: String,
+    pub profile: AiProfileSnapshot,
+    pub schema_version: u32,
+    pub prompt_version: u32,
+    pub evidence_digest: String,
+    pub evidence_json: String,
+    pub deadline_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmTaskCompleted {
+    pub task_id: String,
+    pub request_id: String,
+    pub schema_version: u32,
+    pub status: String,
+    pub result_json: String,
+    pub evidence_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelLlmTask {
+    pub task_id: String,
+    pub request_id: String,
+    pub reason: String,
+}
+
+impl CancelLlmTask {
+    pub fn validate(&self) -> Result<()> {
+        if self.task_id.is_empty() || self.request_id.is_empty() || self.reason.len() > 512 {
+            bail!("invalid llm task cancellation");
+        }
+        Ok(())
+    }
+}
+
+impl LlmTaskCompleted {
+    pub fn validate(&self) -> Result<()> {
+        if self.task_id.is_empty() || self.request_id.is_empty() {
+            bail!("task and request ids are required");
+        }
+        if self.schema_version == 0 || self.result_json.len() > 262_144 {
+            bail!("invalid llm task result schema or size");
+        }
+        if !matches!(
+            self.status.as_str(),
+            "completed" | "insufficient_evidence" | "failed"
+        ) {
+            bail!("invalid llm task result status");
+        }
+        Ok(())
+    }
+}
+
+impl SubmitLlmTask {
+    pub fn validate(&self) -> Result<()> {
+        if self.task_id.is_empty() || self.request_id.is_empty() {
+            bail!("task and request ids are required");
+        }
+        if self.task_kind != "ops_diagnosis" {
+            bail!("unsupported llm task kind");
+        }
+        self.profile.validate()?;
+        if self.profile.pipeline_type != AiPipelineType::LlmTask {
+            bail!("llm task requires an llm_task profile");
+        }
+        if self.schema_version == 0
+            || self.prompt_version == 0
+            || self.deadline_ms == 0
+            || self.deadline_ms > 300_000
+        {
+            bail!("task versions and deadline must be positive");
+        }
+        if self.evidence_json.len() > 262_144 {
+            bail!("evidence budget exceeded");
+        }
+        Ok(())
+    }
 }
 
 impl SubmitPostCallJob {

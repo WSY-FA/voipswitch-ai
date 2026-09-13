@@ -232,6 +232,49 @@ fn dispatch(
             }
             Ok(responses)
         }
+        ControlMessage::SubmitLlmTask(request) => {
+            request
+                .validate()
+                .map_err(|error| anyhow::anyhow!("INVALID_ARGUMENT: {error}"))?;
+            if request.deadline_ms <= ai_protocol::time::unix_timestamp_ms() {
+                return Ok(vec![ControlMessage::LlmTaskCompleted(
+                    ai_protocol::control::LlmTaskCompleted {
+                        task_id: request.task_id,
+                        request_id: request.request_id,
+                        schema_version: request.schema_version,
+                        status: "failed".into(),
+                        result_json: serde_json::json!({"error":"MODEL_TIMEOUT"}).to_string(),
+                        evidence_digest: request.evidence_digest,
+                    },
+                )]);
+            }
+            let result = serde_json::json!({"status":"insufficient_evidence","summary":"evidence is insufficient; external model was not invoked","recommendations":[]});
+            Ok(vec![ControlMessage::LlmTaskCompleted(
+                ai_protocol::control::LlmTaskCompleted {
+                    task_id: request.task_id,
+                    request_id: request.request_id,
+                    schema_version: request.schema_version,
+                    status: "insufficient_evidence".into(),
+                    result_json: result.to_string(),
+                    evidence_digest: request.evidence_digest,
+                },
+            )])
+        }
+        ControlMessage::CancelLlmTask(request) => {
+            request
+                .validate()
+                .map_err(|error| anyhow::anyhow!("INVALID_ARGUMENT: {error}"))?;
+            Ok(vec![ControlMessage::LlmTaskCompleted(
+                ai_protocol::control::LlmTaskCompleted {
+                    task_id: request.task_id,
+                    request_id: request.request_id,
+                    schema_version: 1,
+                    status: "failed".into(),
+                    result_json: serde_json::json!({"error":"CANCELLED"}).to_string(),
+                    evidence_digest: String::new(),
+                },
+            )])
+        }
         ControlMessage::EndAudioInput(request) => {
             owned_jobs.insert(request.job.job_id.clone());
             let job = request.job.clone();

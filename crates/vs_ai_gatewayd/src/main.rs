@@ -88,6 +88,7 @@ async fn main() -> Result<()> {
     let web_state = Arc::new(web::WebState {
         gateway: gateway.clone(),
         sessions: Default::default(),
+        ai_ops_tasks: Default::default(),
     });
     let web_listener = TcpListener::bind(args.web_bind).await?;
     let web = tokio::spawn(async move {
