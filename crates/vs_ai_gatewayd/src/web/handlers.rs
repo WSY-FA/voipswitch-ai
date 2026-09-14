@@ -65,13 +65,23 @@ async fn ai_ops_tasks(
     if authenticated(&state, &headers).is_none() {
         return auth_required();
     }
-    let tasks = state
-        .ai_ops_tasks
-        .lock()
-        .expect("tasks lock")
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut tasks: Vec<serde_json::Value> = Vec::new();
+    {
+        let conn = state.ai_ops_db.lock().expect("db lock");
+        let mut stmt = conn
+            .prepare("SELECT payload FROM ai_ops_task ORDER BY created_at_ms DESC")
+            .map_err(|e| warn!(%e, "load AI ops tasks failed"))
+            .ok();
+        if let Some(ref mut stmt) = stmt {
+            if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+                for row in rows.flatten() {
+                    if let Ok(value) = serde_json::from_str(&row) {
+                        tasks.push(value);
+                    }
+                }
+            }
+        }
+    }
     let page = query
         .get("page")
         .and_then(|v| v.parse::<usize>().ok())
@@ -127,13 +137,18 @@ async fn get_ai_ops_task(
     if authenticated(&state, &headers).is_none() {
         return auth_required();
     }
-    match state
-        .ai_ops_tasks
+    let persisted = state
+        .ai_ops_db
         .lock()
-        .expect("tasks lock")
-        .get(&task_id)
-        .cloned()
-    {
+        .expect("db lock")
+        .query_row(
+            "SELECT payload FROM ai_ops_task WHERE task_id=?1",
+            rusqlite::params![task_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    match persisted {
         Some(task) => Json(json!({"ok":true,"task":task})).into_response(),
         None => api_error(
             StatusCode::NOT_FOUND,
@@ -182,6 +197,26 @@ async fn create_ai_ops_task(
         object.insert(
             "created_at_ms".into(),
             json!(ai_protocol::time::unix_timestamp_ms()),
+        );
+    }
+    let _ = state.ai_ops_db.lock().expect("db lock").execute(
+        "UPDATE ai_ops_task SET payload=?1 WHERE task_id=?2",
+        rusqlite::params![task.to_string(), task_id],
+    );
+    let created_at = task
+        .get("created_at_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let payload_text = task.to_string();
+    if let Err(error) = state.ai_ops_db.lock().expect("db lock").execute(
+        "INSERT INTO ai_ops_task (task_id,payload,created_at_ms) VALUES (?1,?2,?3)",
+        rusqlite::params![task_id, payload_text, created_at],
+    ) {
+        warn!(%error, "persist AI ops task failed");
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "failed to persist task",
         );
     }
     tasks.insert(task_id.to_owned(), task.clone());
